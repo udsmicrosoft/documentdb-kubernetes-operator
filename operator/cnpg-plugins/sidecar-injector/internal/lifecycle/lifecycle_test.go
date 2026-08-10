@@ -39,6 +39,59 @@ func envNames(env []corev1.EnvVar) []string {
 	return out
 }
 
+func TestGetCapabilitiesOnlyHandlesPodCreate(t *testing.T) {
+	response, err := Implementation{}.GetCapabilities(
+		context.Background(),
+		&cnpglifecycle.OperatorLifecycleCapabilitiesRequest{},
+	)
+	if err != nil {
+		t.Fatalf("GetCapabilities() error: %v", err)
+	}
+	if len(response.LifecycleCapabilities) != 1 {
+		t.Fatalf("capabilities count = %d, want 1", len(response.LifecycleCapabilities))
+	}
+
+	capability := response.LifecycleCapabilities[0]
+	if capability.Group != "" || capability.Kind != "Pod" {
+		t.Fatalf("capability = group %q kind %q, want core Pod", capability.Group, capability.Kind)
+	}
+	if len(capability.OperationTypes) != 1 {
+		t.Fatalf("operation count = %d, want 1", len(capability.OperationTypes))
+	}
+	if capability.OperationTypes[0].Type != cnpglifecycle.OperatorOperationType_TYPE_CREATE {
+		t.Fatalf("operation = %s, want TYPE_CREATE", capability.OperationTypes[0].Type)
+	}
+}
+
+func TestLifecycleHookPatchDoesNotMutatePod(t *testing.T) {
+	pod := &corev1.Pod{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: "v1",
+			Kind:       "Pod",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "cluster-1",
+			Namespace: "default",
+		},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{{Name: "postgres"}},
+		},
+	}
+
+	response, err := Implementation{}.LifecycleHook(context.Background(), &cnpglifecycle.OperatorLifecycleRequest{
+		OperationType: &cnpglifecycle.OperatorOperationType{
+			Type: cnpglifecycle.OperatorOperationType_TYPE_PATCH,
+		},
+		ObjectDefinition: mustMarshal(t, pod),
+	})
+	if err != nil {
+		t.Fatalf("LifecycleHook() error: %v", err)
+	}
+	if len(response.JsonPatch) != 0 {
+		t.Fatalf("PATCH operation returned pod mutations: %s", string(response.JsonPatch))
+	}
+}
+
 // TestInjectGatewayOTelEnv_AllAppended covers the CREATE case: empty gateway
 // env, both OTel env vars appended in declaration order. Per-pod attribution
 // (k8s.pod.name) is added by the collector's resource processor downstream,
@@ -90,10 +143,8 @@ func TestInjectGatewayOTelEnv_PreservesExisting(t *testing.T) {
 	}
 }
 
-// TestInjectGatewayOTelEnv_Idempotent is the actual CNPG-PATCH scenario: a
-// second invocation on the output of the first must produce a byte-equal Env
-// slice. Otherwise CNPG's reconciler trips on "spec: Forbidden: pod updates
-// may not change fields other than ...".
+// TestInjectGatewayOTelEnv_Idempotent verifies that repeated construction does
+// not duplicate environment variables on an already-mutated pod.
 func TestInjectGatewayOTelEnv_Idempotent(t *testing.T) {
 	pod := gatewayContainer()
 	injectGatewayOTelEnv(pod)

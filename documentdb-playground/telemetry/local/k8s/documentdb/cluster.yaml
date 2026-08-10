@@ -29,7 +29,8 @@ spec:
   resource:
     storage:
       pvcSize: 5Gi
-  sidecarInjectorPluginName: cnpg-i-sidecar-injector.documentdb.io
+  plugins:
+    sidecarInjectorName: cnpg-i-sidecar-injector.documentdb.io
   # Enable the OTel Collector sidecar (one per pod). The sidecar:
   #   - receives OTLP metrics from the documentdb-gateway on localhost:4317
   #   - exposes Prometheus /metrics on the configured port

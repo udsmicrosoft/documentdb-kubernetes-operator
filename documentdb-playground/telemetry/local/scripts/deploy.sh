@@ -106,8 +106,8 @@ kubectl create configmap grafana-dashboards \
 # Step 5: Deploy DocumentDB
 # spec.monitoring.enabled triggers the operator to create an OTel ConfigMap
 # and inject the otel-collector sidecar via the CNPG sidecar-injector plugin.
-# The CNPG-managed <cluster>-app secret is reused for the sidecar's PG creds —
-# no dedicated monitoring role is needed.
+# The operator provisions the dedicated passwordless otel_monitor role used by
+# the sidecar's local PostgreSQL connection.
 echo "[5/6] Deploying DocumentDB..."
 kubectl apply -f "$LOCAL_DIR/k8s/documentdb/" --context "$CONTEXT"
 

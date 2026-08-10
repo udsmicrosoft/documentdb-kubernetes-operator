@@ -191,7 +191,6 @@ func (impl Implementation) GetCapabilities(
                 Kind:  "Pod",
                 OperationTypes: []*lifecycle.OperatorOperationType{
                     {Type: lifecycle.OperatorOperationType_TYPE_CREATE},
-                    {Type: lifecycle.OperatorOperationType_TYPE_PATCH},
                 },
             },
         },
@@ -380,7 +379,7 @@ When developing or reviewing CNPG-I plugin code:
 
 2. **Incorrect JSON patch direction** — `object.CreatePatch(mutated, original)` takes mutated first, original second. Swapping them produces an inverse patch.
 
-3. **Not handling all operation types** — If your lifecycle hook registers for `TYPE_CREATE` and `TYPE_PATCH`, make sure your `LifecycleHook` implementation handles both (or returns an empty response for unhandled operations).
+3. **Mutating Pod spec during PATCH**: Pod containers, volumes, and environment variables are immutable after creation. Sidecar injectors should register for `TYPE_CREATE` only. Register `TYPE_PATCH` only when the hook is restricted to mutable fields.
 
 4. **Plugin name mismatch** — The plugin name in metadata, the Kubernetes Service label `cnpg.io/pluginName`, and the Cluster spec `plugins[].name` must all match exactly.
 

@@ -44,16 +44,13 @@ func (impl Implementation) GetCapabilities(
 					{
 						Type: lifecycle.OperatorOperationType_TYPE_CREATE,
 					},
-					{
-						Type: lifecycle.OperatorOperationType_TYPE_PATCH,
-					},
 				},
 			},
 		},
 	}, nil
 }
 
-// LifecycleHook is called by CNPG for Pod CREATE/PATCH/UPDATE operations
+// LifecycleHook is called by CNPG for Pod CREATE operations.
 func (impl Implementation) LifecycleHook(
 	ctx context.Context,
 	request *lifecycle.OperatorLifecycleRequest,
@@ -71,8 +68,7 @@ func (impl Implementation) LifecycleHook(
 	switch kind {
 	case "Pod":
 		switch *operation {
-		case lifecycle.OperatorOperationType_TYPE_CREATE, lifecycle.OperatorOperationType_TYPE_PATCH,
-			lifecycle.OperatorOperationType_TYPE_UPDATE:
+		case lifecycle.OperatorOperationType_TYPE_CREATE:
 			return impl.reconcileMetadata(ctx, request)
 		}
 		// add any other custom logic to execute based on the operation
@@ -249,7 +245,7 @@ func (impl Implementation) reconcileMetadata(
 		log.Printf("Injecting OTel Collector sidecar with image: %s", configuration.OtelCollectorImage)
 
 		// Add ConfigMap volume for operator-generated config files (static.yaml + dynamic.yaml)
-		// Check for existing volume to be idempotent across CREATE and PATCH operations
+		// Check for an existing volume so pod construction remains idempotent.
 		otelVolFound := false
 		for _, v := range mutatedPod.Spec.Volumes {
 			if v.Name == "otel-config" {
@@ -463,11 +459,9 @@ func gatewayOTelEnvVars() []corev1.EnvVar {
 // container, idempotently. Existing env vars with the same name are preserved
 // (we don't overwrite) and missing ones are appended in declaration order.
 //
-// Idempotency matters: this hook fires on both CREATE and PATCH operations.
-// Without name-based dedup, repeated reconciles would double-append env
-// entries and CNPG's pod metadata reconciler would fail with
-// "Pod is invalid: spec: Forbidden: pod updates may not change fields other
-// than ...".
+// Idempotency keeps pod construction stable if a caller passes an already
+// mutated pod. Container injection itself runs only for CREATE because
+// Kubernetes forbids adding or removing containers from an existing pod.
 func injectGatewayOTelEnv(pod *corev1.Pod) {
 	envs := gatewayOTelEnvVars()
 	for i := range pod.Spec.Containers {
