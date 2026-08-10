@@ -29,6 +29,31 @@ const (
 	envOldDocumentDBImage = "E2E_UPGRADE_OLD_DOCUMENTDB_IMAGE"
 	envNewDocumentDBImage = "E2E_UPGRADE_NEW_DOCUMENTDB_IMAGE"
 
+	// Old/new DocumentDB *versions* (e.g. "0.110.0" / "0.113.0") for the
+	// schema-upgrade spec. These drive spec.documentDBVersion — the
+	// user-facing knob that sets both the extension and gateway images
+	// together — rather than raw image overrides. The extension's
+	// installed schema semver matches the version string, so the same
+	// values are used to assert status.schemaVersion progression across
+	// the two-phase upgrade.
+	envOldDocumentDBVersion = "E2E_UPGRADE_OLD_DOCUMENTDB_VERSION"
+	envNewDocumentDBVersion = "E2E_UPGRADE_NEW_DOCUMENTDB_VERSION"
+
+	// Default old/new versions for the schema-upgrade spec, applied when
+	// the env vars above are unset. Chosen as the last released pair so
+	// the spec exercises a real two-phase migration on every e2e PR
+	// without depending on repo-level CI vars. Both images are published
+	// on the public GHCR documentdb/gateway repos, so documentDBVersion
+	// resolves to pullable tags in kind.
+	//
+	// This pair is the single source of truth for the CI default and is
+	// bumped automatically by .github/workflows/release_documentdb_images.yml
+	// on each DocumentDB release (old <- previous default, new <- released
+	// version). Do not duplicate it into workflow env; test-e2e.yml only
+	// passes an optional workflow_dispatch override.
+	defaultOldDocumentDBVersion = "0.109.0"
+	defaultNewDocumentDBVersion = "0.110.0"
+
 	// Optional gateway image overrides for the image-upgrade spec.
 	// When unset the spec patches only spec.image.documentDB and leaves
 	// spec.image.gateway as-is (operator uses its default gateway). The

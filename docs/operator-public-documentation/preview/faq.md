@@ -21,7 +21,7 @@ DocumentDB uses PostgreSQL as its underlying storage engine. The DocumentDB Gate
 
 ### Which Kubernetes distributions are supported?
 
-The operator works on any conformant Kubernetes distribution (version 1.35 or later). It has been tested on:
+The operator works on any conformant Kubernetes distribution (version 1.35 or later, or 1.33/1.34 with the ImageVolume feature gate enabled). It has been tested on:
 
 - **Azure Kubernetes Service (AKS)**
 - **Amazon Elastic Kubernetes Service (EKS)**
@@ -40,7 +40,7 @@ See the [API Reference](api-reference.md) for auto-generated documentation of al
 
 ### What are the minimum Kubernetes version requirements?
 
-Kubernetes **1.35 or later** is required. The operator uses the [ImageVolume](https://kubernetes.io/docs/concepts/storage/volumes/#image) feature, which became generally available in Kubernetes 1.35.
+The operator depends on the [ImageVolume](https://kubernetes.io/docs/concepts/storage/volumes/#image) feature to mount the DocumentDB extension. That feature is GA (on by default) in **Kubernetes 1.35+**, which is the recommended baseline. On **1.33 or 1.34** the feature is beta and off by default, so it works only if you enable the `ImageVolume` feature gate on the kube-apiserver and every kubelet (self-managed clusters only) with a container runtime that supports image volumes (containerd ≥ 2.1 or CRI-O ≥ 1.33). When the feature is unavailable, the operator's admission webhook rejects `DocumentDB` creation with an actionable error rather than letting pods hang.
 
 ### Do I need to install CloudNativePG separately?
 

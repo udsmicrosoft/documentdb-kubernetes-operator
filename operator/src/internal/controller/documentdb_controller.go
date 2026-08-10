@@ -8,7 +8,6 @@ import (
 	"context"
 	"fmt"
 	"slices"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -524,17 +523,11 @@ func documentDBServicePredicate() predicate.Predicate {
 // SetupWithManager sets up the controller with the Manager.
 func (r *DocumentDBReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	if r.Clientset == nil {
-		return fmt.Errorf("Clientset must be configured: required for Kubernetes version detection and SQL execution")
+		return fmt.Errorf("Clientset must be configured: required for SQL execution against the CNPG primary")
 	}
 
 	if r.SQLExecutor == nil {
 		r.SQLExecutor = r.executeSQLCommand
-	}
-
-	// Verify the cluster meets the minimum Kubernetes version requirement.
-	// ImageVolume (GA in K8s 1.35) is required for mounting the DocumentDB extension image.
-	if err := r.validateK8sVersion(); err != nil {
-		return err
 	}
 
 	return ctrl.NewControllerManagedBy(mgr).
@@ -545,43 +538,6 @@ func (r *DocumentDBReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&cnpgv1.Subscription{}).
 		Named("documentdb-controller").
 		Complete(r)
-}
-
-// validateK8sVersion checks that the Kubernetes cluster version is at least 1.35.
-// The operator requires ImageVolume (GA in K8s 1.35) to mount the DocumentDB extension image.
-// Callers must ensure Clientset is non-nil before calling this method.
-func (r *DocumentDBReconciler) validateK8sVersion() error {
-	serverVersion, err := r.Clientset.Discovery().ServerVersion()
-	if err != nil {
-		return fmt.Errorf("failed to detect Kubernetes version: %w", err)
-	}
-
-	majorStr := strings.TrimRight(serverVersion.Major, "+")
-	major, err := strconv.Atoi(majorStr)
-	if err != nil {
-		return fmt.Errorf("failed to parse Kubernetes major version %q: %w", serverVersion.Major, err)
-	}
-
-	// Future major versions (>1) are assumed to support ImageVolume.
-	if major > 1 {
-		return nil
-	}
-
-	minorStr := strings.TrimRight(serverVersion.Minor, "+")
-	minor, err := strconv.Atoi(minorStr)
-	if err != nil {
-		return fmt.Errorf("failed to parse Kubernetes minor version %q: %w", serverVersion.Minor, err)
-	}
-
-	if minor < util.MinK8sMinorVersion {
-		return fmt.Errorf(
-			"kubernetes version %s.%s is not supported: the DocumentDB operator requires Kubernetes 1.%d+ "+
-				"for ImageVolume support (GA in K8s 1.%d). Please upgrade your cluster",
-			serverVersion.Major, serverVersion.Minor, util.MinK8sMinorVersion, util.MinK8sMinorVersion,
-		)
-	}
-
-	return nil
 }
 
 // COPIED FROM https://github.com/cloudnative-pg/cloudnative-pg/blob/release-1.25/internal/cmd/plugin/promote/promote.go

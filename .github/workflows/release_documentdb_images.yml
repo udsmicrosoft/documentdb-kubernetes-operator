@@ -14,7 +14,7 @@ on:
       version:
         description: 'Database image release version (e.g., 0.111.0)'
         required: true
-        default: '0.110.0'
+        default: '0.113.0'
       update_defaults:
         description: 'Create PR to update default image versions in code'
         required: false
@@ -135,6 +135,16 @@ jobs:
           sed -i "s|pg17-${OLD_VERSION}|pg17-${NEW_VERSION}|" \
             .github/dockerfiles/Dockerfile_gateway_public_image
 
+          # 9. Update e2e schema-upgrade default version pair. This is the
+          # single source of truth for the two-phase migration spec's CI
+          # default (test-e2e.yml passes only an optional override), so the
+          # released pair advances with each DB release: old <- previous
+          # default (OLD_VERSION), new <- released version (NEW_VERSION).
+          sed -i -E "s|(defaultOldDocumentDBVersion = )\"[0-9]+\.[0-9]+\.[0-9]+\"|\1\"${OLD_VERSION}\"|" \
+            test/e2e/tests/upgrade/helpers_test.go
+          sed -i -E "s|(defaultNewDocumentDBVersion = )\"[0-9]+\.[0-9]+\.[0-9]+\"|\1\"${NEW_VERSION}\"|" \
+            test/e2e/tests/upgrade/helpers_test.go
+
           echo "=== Files modified ==="
           git diff --name-only
           echo ""
@@ -158,6 +168,7 @@ jobs:
             - Updated `documentDbVersion` in Helm chart `values.yaml`
             - Updated build/release workflow defaults in `build_documentdb_images.yml` and `release_documentdb_images.yml`
             - Updated gateway Dockerfile default source image in `Dockerfile_gateway_public_image`
+            - Updated e2e schema-upgrade default version pair in `test/e2e/tests/upgrade/helpers_test.go` (old `${{ steps.current.outputs.current_version }}` → new `${{ inputs.version }}`)
 
             ### Image References
             - `ghcr.io/${{ github.repository }}/documentdb:${{ inputs.version }}`
@@ -173,14 +184,16 @@ jobs:
 
       - name: Release summary
         run: |
-          echo "## DocumentDB Image Release Summary" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "- **Database Version**: \`${{ inputs.version }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "- **Images Promoted**: documentdb, gateway" >> $GITHUB_STEP_SUMMARY
-          echo "- **Source Tag**: \`${{ inputs.candidate_version }}\` → \`${{ inputs.version }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
+          {
+            echo "## DocumentDB Image Release Summary"
+            echo ""
+            echo "- **Database Version**: \`${{ inputs.version }}\`"
+            echo "- **Images Promoted**: documentdb, gateway"
+            echo "- **Source Tag**: \`${{ inputs.candidate_version }}\` → \`${{ inputs.version }}\`"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
           if [[ "${{ steps.current.outputs.current_version }}" != "${{ inputs.version }}" ]]; then
-            echo "- **PR Created**: Updates default versions from \`${{ steps.current.outputs.current_version }}\` to \`${{ inputs.version }}\`" >> $GITHUB_STEP_SUMMARY
+            echo "- **PR Created**: Updates default versions from \`${{ steps.current.outputs.current_version }}\` to \`${{ inputs.version }}\`" >> "$GITHUB_STEP_SUMMARY"
           else
-            echo "- **No PR needed**: Version \`${{ inputs.version }}\` is already the default" >> $GITHUB_STEP_SUMMARY
+            echo "- **No PR needed**: Version \`${{ inputs.version }}\` is already the default" >> "$GITHUB_STEP_SUMMARY"
           fi

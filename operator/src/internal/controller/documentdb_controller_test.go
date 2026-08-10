@@ -18,10 +18,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/apimachinery/pkg/version"
-	fakediscovery "k8s.io/client-go/discovery/fake"
 	kubefake "k8s.io/client-go/kubernetes/fake"
-	k8stesting "k8s.io/client-go/testing"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -2809,21 +2806,6 @@ var _ = Describe("DocumentDB Controller", func() {
 			output, _ := reconciler.SQLExecutor(context.Background(), nil, "")
 			Expect(output).To(Equal("custom"))
 		})
-
-		It("should return error when K8s version validation fails", func() {
-			clientset := kubefake.NewSimpleClientset()
-			fakeDisc, ok := clientset.Discovery().(*fakediscovery.FakeDiscovery)
-			Expect(ok).To(BeTrue())
-			fakeDisc.FakedServerVersion = &version.Info{Major: "1", Minor: "34"}
-
-			reconciler := &DocumentDBReconciler{
-				Clientset: clientset,
-			}
-
-			err := reconciler.SetupWithManager(nil)
-			Expect(err).To(HaveOccurred())
-			Expect(err.Error()).To(ContainSubstring("not supported"))
-		})
 	})
 
 	Describe("Reconcile", func() {
@@ -3110,99 +3092,6 @@ var _ = Describe("DocumentDB Controller", func() {
 			Expect(fakeClient.Get(ctx, types.NamespacedName{Name: documentDBName, Namespace: documentDBNamespace}, updatedCluster)).To(Succeed())
 			Expect(updatedCluster.Spec.Plugins[0].Parameters["gatewayTLSSecret"]).To(Equal("new-tls-secret"))
 			Expect(updatedCluster.Annotations).To(HaveKey("kubectl.kubernetes.io/restartedAt"))
-		})
-	})
-
-	Describe("validateK8sVersion", func() {
-		It("should return nil for K8s >= 1.35", func() {
-			clientset := kubefake.NewSimpleClientset()
-			fakeDisc, ok := clientset.Discovery().(*fakediscovery.FakeDiscovery)
-			Expect(ok).To(BeTrue())
-			fakeDisc.FakedServerVersion = &version.Info{Major: "1", Minor: "35"}
-
-			reconciler := &DocumentDBReconciler{Clientset: clientset}
-			Expect(reconciler.validateK8sVersion()).To(Succeed())
-		})
-
-		It("should return error for K8s < 1.35", func() {
-			clientset := kubefake.NewSimpleClientset()
-			fakeDisc, ok := clientset.Discovery().(*fakediscovery.FakeDiscovery)
-			Expect(ok).To(BeTrue())
-			fakeDisc.FakedServerVersion = &version.Info{Major: "1", Minor: "34"}
-
-			reconciler := &DocumentDBReconciler{Clientset: clientset}
-			err := reconciler.validateK8sVersion()
-			Expect(err).To(HaveOccurred())
-			Expect(err.Error()).To(ContainSubstring("not supported"))
-			Expect(err.Error()).To(ContainSubstring("1.35"))
-		})
-
-		It("should return nil for K8s 1.36+", func() {
-			clientset := kubefake.NewSimpleClientset()
-			fakeDisc, ok := clientset.Discovery().(*fakediscovery.FakeDiscovery)
-			Expect(ok).To(BeTrue())
-			fakeDisc.FakedServerVersion = &version.Info{Major: "1", Minor: "36"}
-
-			reconciler := &DocumentDBReconciler{Clientset: clientset}
-			Expect(reconciler.validateK8sVersion()).To(Succeed())
-		})
-
-		It("should return nil for future major versions (e.g. K8s 2.0)", func() {
-			clientset := kubefake.NewSimpleClientset()
-			fakeDisc, ok := clientset.Discovery().(*fakediscovery.FakeDiscovery)
-			Expect(ok).To(BeTrue())
-			fakeDisc.FakedServerVersion = &version.Info{Major: "2", Minor: "0"}
-
-			reconciler := &DocumentDBReconciler{Clientset: clientset}
-			Expect(reconciler.validateK8sVersion()).To(Succeed())
-		})
-
-		It("should handle minor version with + suffix", func() {
-			clientset := kubefake.NewSimpleClientset()
-			fakeDisc, ok := clientset.Discovery().(*fakediscovery.FakeDiscovery)
-			Expect(ok).To(BeTrue())
-			fakeDisc.FakedServerVersion = &version.Info{Major: "1", Minor: "35+"}
-
-			reconciler := &DocumentDBReconciler{Clientset: clientset}
-			Expect(reconciler.validateK8sVersion()).To(Succeed())
-		})
-
-		It("should return error when ServerVersion fails", func() {
-			clientset := kubefake.NewSimpleClientset()
-			fakeDisc, ok := clientset.Discovery().(*fakediscovery.FakeDiscovery)
-			Expect(ok).To(BeTrue())
-			fakeDisc.PrependReactor("*", "*", func(action k8stesting.Action) (bool, runtime.Object, error) {
-				return true, nil, fmt.Errorf("connection refused")
-			})
-
-			reconciler := &DocumentDBReconciler{Clientset: clientset}
-			err := reconciler.validateK8sVersion()
-			Expect(err).To(HaveOccurred())
-			Expect(err.Error()).To(ContainSubstring("failed to detect"))
-		})
-
-		It("should return error when minor version is not a number", func() {
-			clientset := kubefake.NewSimpleClientset()
-			fakeDisc, ok := clientset.Discovery().(*fakediscovery.FakeDiscovery)
-			Expect(ok).To(BeTrue())
-			fakeDisc.FakedServerVersion = &version.Info{Major: "1", Minor: "abc"}
-
-			reconciler := &DocumentDBReconciler{Clientset: clientset}
-			err := reconciler.validateK8sVersion()
-			Expect(err).To(HaveOccurred())
-			Expect(err.Error()).To(ContainSubstring("failed to parse"))
-		})
-
-		It("should return error when major version is not a number", func() {
-			clientset := kubefake.NewSimpleClientset()
-			fakeDisc, ok := clientset.Discovery().(*fakediscovery.FakeDiscovery)
-			Expect(ok).To(BeTrue())
-			fakeDisc.FakedServerVersion = &version.Info{Major: "abc", Minor: "35"}
-
-			reconciler := &DocumentDBReconciler{Clientset: clientset}
-			err := reconciler.validateK8sVersion()
-			Expect(err).To(HaveOccurred())
-			Expect(err.Error()).To(ContainSubstring("failed to parse Kubernetes major version"))
 		})
 	})
 

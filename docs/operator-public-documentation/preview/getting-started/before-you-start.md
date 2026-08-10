@@ -19,13 +19,13 @@ Before installing the DocumentDB Kubernetes Operator, ensure you have the follow
 
 | Component | Minimum Version | Purpose | Installation Guide |
 |-----------|-----------------|---------|-------------------|
-| **Kubernetes cluster** | 1.35+ | Container orchestration platform | See [Cluster Options](#kubernetes-cluster-options) |
-| **kubectl** | 1.35+ | Kubernetes command-line tool | [Install kubectl](https://kubernetes.io/docs/tasks/tools/) |
+| **Kubernetes cluster** | 1.35+ (or 1.33/1.34 with the ImageVolume gate enabled) | Container orchestration platform | See [Cluster Options](#kubernetes-cluster-options) |
+| **kubectl** | 1.34+ | Kubernetes command-line tool (supported within ±1 minor of the cluster; 1.34+ covers the 1.35 baseline) | [Install kubectl](https://kubernetes.io/docs/tasks/tools/) |
 | **Helm** | 3.x | Package manager for Kubernetes | [Install Helm](https://helm.sh/docs/intro/install/) |
 | **cert-manager** | 1.19+ | TLS certificate management | [Install cert-manager](https://cert-manager.io/docs/installation/) |
 
-!!! warning "Kubernetes 1.35+ with containerd or CRI-O Required"
-    The operator requires Kubernetes 1.35 or later because it uses the [ImageVolume](https://kubernetes.io/docs/concepts/storage/volumes/#image) feature (GA in Kubernetes 1.35) to mount the DocumentDB extension into PostgreSQL pods. The cluster must use a **containerd** or **CRI-O** container runtime — Docker does not support ImageVolumes.
+!!! warning "The ImageVolume feature and a containerd or CRI-O runtime are required"
+    The operator mounts the DocumentDB extension into PostgreSQL pods via the [ImageVolume](https://kubernetes.io/docs/concepts/storage/volumes/#image) feature, so it **must be available on your cluster**, running on a **containerd** or **CRI-O** runtime (Docker is not supported). ImageVolume is GA (on by default) in **Kubernetes 1.35+**; on **1.33/1.34** it is beta and works only if you enable the `ImageVolume` feature gate on the apiserver and kubelets (self-managed clusters; containerd ≥ 2.1 or CRI-O ≥ 1.33). If the feature is unavailable, the operator's admission webhook rejects `DocumentDB` creation with an actionable error instead of leaving pods stuck.
 
 ### Optional components
 
@@ -38,7 +38,7 @@ Before installing the DocumentDB Kubernetes Operator, ensure you have the follow
 
 ### Kubernetes cluster options
 
-The operator runs on any conformant Kubernetes distribution (1.35+). Choose based on your environment:
+The operator runs on any conformant Kubernetes distribution (1.35+, or 1.33/1.34 with the ImageVolume feature gate enabled). Choose based on your environment:
 
 === "Local Development"
 

@@ -46,6 +46,16 @@ on:
         required: false
         type: boolean
         default: false
+      old_documentdb_version:
+        description: 'Schema-upgrade spec: OLD DocumentDB version override (empty = built-in default)'
+        required: false
+        type: string
+        default: ''
+      new_documentdb_version:
+        description: 'Schema-upgrade spec: NEW DocumentDB version override (empty = built-in default)'
+        required: false
+        type: string
+        default: ''
 
 permissions:
   contents: read
@@ -191,6 +201,15 @@ jobs:
       E2E_UPGRADE_CURRENT_CHART: ${{ vars.E2E_UPGRADE_CURRENT_CHART || '' }}
       E2E_UPGRADE_OLD_DOCUMENTDB_IMAGE: ${{ vars.E2E_UPGRADE_OLD_DOCUMENTDB_IMAGE || '' }}
       E2E_UPGRADE_NEW_DOCUMENTDB_IMAGE: ${{ vars.E2E_UPGRADE_NEW_DOCUMENTDB_IMAGE || '' }}
+      # Schema-upgrade spec knobs (spec.documentDBVersion + spec.schemaVersion).
+      # The released old->new pair is the built-in default in the spec
+      # (defaultOldDocumentDBVersion / defaultNewDocumentDBVersion in
+      # test/e2e/tests/upgrade/helpers_test.go), which is the single source of
+      # truth and is auto-bumped by release_documentdb_images.yml on each DB
+      # release. Leaving these empty lets that default apply; a workflow_dispatch
+      # input overrides it for a one-off manual run.
+      E2E_UPGRADE_OLD_DOCUMENTDB_VERSION: ${{ inputs.old_documentdb_version || '' }}
+      E2E_UPGRADE_NEW_DOCUMENTDB_VERSION: ${{ inputs.new_documentdb_version || '' }}
 
     steps:
       - name: Checkout repository
@@ -341,6 +360,228 @@ jobs:
           name: e2e-logs-${{ matrix.group }}-${{ matrix.architecture }}-${{ github.run_attempt }}
           path: |
             test/e2e/artifacts/
+            /tmp/cluster-logs/
+          if-no-files-found: ignore
+          retention-days: 14
+
+  # ---------------------------------------------------------------------------
+  # ImageVolume preflight (positive path, K8s < 1.35).
+  #
+  # Proves the operator works on Kubernetes versions BELOW the 1.35 GA of the
+  # ImageVolume feature, provided the feature gate is enabled. On these
+  # clusters the webhook's capability probe must ADMIT the DocumentDB, and the
+  # extension image must actually MOUNT at runtime (containerd >= 2.1, shipped
+  # in kind's 1.33/1.34 node images) for the cluster to reach Healthy.
+  #
+  # No Ginkgo specs run here on purpose: the composite action already deploys a
+  # DocumentDB and waits for Healthy as part of setup, so a green setup IS the
+  # end-to-end assertion. If the gate were off or the runtime too old, setup
+  # would fail. The gate-OFF / blocked path is covered by the webhook unit
+  # tests (operator/src/internal/webhook), not by CI.
+  # ---------------------------------------------------------------------------
+  imagevolume-preflight:
+    name: ImageVolume preflight (k8s ${{ matrix.kubernetes_version }})
+    needs: [build]
+    if: always() && needs.build.result == 'success'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        # Lowest supported versions where ImageVolume is still beta/off by
+        # default; the composite action turns the gate on for both.
+        kubernetes_version: [v1.33.7, v1.34.3]
+    env:
+      IMAGE_TAG: ${{ needs.build.outputs.image_tag }}
+      EXT_IMAGE_TAG: ${{ needs.build.outputs.ext_image_tag }}
+      CHART_VERSION: ${{ needs.build.outputs.chart_version || '0.1.0' }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download platform images artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: build-platform-images
+          path: ./artifacts/build-platform-images
+
+      - name: Download helm chart artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: build-helm-chart-amd64
+          path: ./artifacts/build-helm-chart-amd64
+
+      - name: Setup test environment (ImageVolume gate enabled)
+        uses: ./.github/actions/setup-test-environment
+        with:
+          test-type: 'e2e'
+          architecture: 'amd64'
+          runner: 'ubuntu-22.04'
+          test-scenario-name: imagevolume
+          node-count: '1'
+          instances-per-node: '1'
+          cert-manager-namespace: ${{ env.CERT_MANAGER_NS }}
+          operator-namespace: ${{ env.OPERATOR_NS }}
+          db-namespace: ${{ env.DB_NS }}
+          db-cluster-name: ${{ env.DB_NAME }}
+          db-username: ${{ env.DB_USERNAME }}
+          db-password: ${{ env.DB_PASSWORD }}
+          db-port: ${{ env.DB_PORT }}
+          image-tag: ${{ env.IMAGE_TAG }}
+          documentdb-image-tag: ${{ env.EXT_IMAGE_TAG }}
+          chart-version: ${{ env.CHART_VERSION }}
+          use-external-images: 'false'
+          kubernetes-version: ${{ matrix.kubernetes_version }}
+          kind-feature-gates: 'ImageVolume'
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          repository-owner: ${{ github.repository_owner }}
+
+      - name: Collect cluster diagnostics
+        if: failure()
+        uses: ./.github/actions/collect-logs
+        with:
+          architecture: amd64
+          operator-namespace: ${{ env.OPERATOR_NS }}
+          db-namespace: ${{ env.DB_NS }}
+          db-name: ${{ env.DB_NAME }}
+
+      - name: Upload diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: imagevolume-preflight-logs-${{ matrix.kubernetes_version }}-${{ github.run_attempt }}
+          path: |
+            /tmp/cluster-logs/
+          if-no-files-found: ignore
+          retention-days: 14
+
+  # ---------------------------------------------------------------------------
+  # ImageVolume block check (negative path).
+  #
+  # The mirror image of imagevolume-preflight: a Kubernetes 1.33 cluster with
+  # the ImageVolume gate EXPLICITLY DISABLED (kind-feature-gates:
+  # 'ImageVolume=false'). We force it off rather than relying on the version
+  # default because ImageVolume's real-world default in 1.33/1.34 is
+  # inconsistent across node images. Here the operator's admission webhook must
+  # REJECT DocumentDB creation with an actionable ImageVolume error instead of
+  # letting pods hang. The composite action provisions the cluster + operator
+  # only (deploy-documentdb: false); the workflow then applies a DocumentDB and
+  # asserts the apply fails with an ImageVolume message. This proves the
+  # fail-fast guarantee end-to-end on a real cluster, complementing the webhook
+  # unit tests.
+  # ---------------------------------------------------------------------------
+  imagevolume-block:
+    name: ImageVolume block (k8s v1.33.7, gate disabled)
+    needs: [build]
+    if: always() && needs.build.result == 'success'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    env:
+      IMAGE_TAG: ${{ needs.build.outputs.image_tag }}
+      EXT_IMAGE_TAG: ${{ needs.build.outputs.ext_image_tag }}
+      CHART_VERSION: ${{ needs.build.outputs.chart_version || '0.1.0' }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download platform images artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: build-platform-images
+          path: ./artifacts/build-platform-images
+
+      - name: Download helm chart artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: build-helm-chart-amd64
+          path: ./artifacts/build-helm-chart-amd64
+
+      - name: Setup test environment (operator only, no DocumentDB)
+        uses: ./.github/actions/setup-test-environment
+        with:
+          test-type: 'e2e'
+          architecture: 'amd64'
+          runner: 'ubuntu-22.04'
+          test-scenario-name: imagevolume-block
+          node-count: '1'
+          instances-per-node: '1'
+          cert-manager-namespace: ${{ env.CERT_MANAGER_NS }}
+          operator-namespace: ${{ env.OPERATOR_NS }}
+          db-namespace: ${{ env.DB_NS }}
+          db-cluster-name: ${{ env.DB_NAME }}
+          db-username: ${{ env.DB_USERNAME }}
+          db-password: ${{ env.DB_PASSWORD }}
+          db-port: ${{ env.DB_PORT }}
+          image-tag: ${{ env.IMAGE_TAG }}
+          documentdb-image-tag: ${{ env.EXT_IMAGE_TAG }}
+          chart-version: ${{ env.CHART_VERSION }}
+          use-external-images: 'false'
+          kubernetes-version: v1.33.7
+          kind-feature-gates: 'ImageVolume=false'
+          deploy-documentdb: 'false'
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          repository-owner: ${{ github.repository_owner }}
+
+      - name: Assert DocumentDB creation is blocked (ImageVolume unavailable)
+        shell: bash
+        run: |
+          echo "Negative test: with the ImageVolume gate off on k8s 1.33, the"
+          echo "operator's admission webhook must REJECT DocumentDB creation."
+
+          # The validating webhook runs its ImageVolume capability probe first
+          # and returns 403 Forbidden before any spec validation, so this apply
+          # is expected to FAIL with a message mentioning ImageVolume.
+          set +e
+          APPLY_OUTPUT="$(cat <<EOF | kubectl apply -f - 2>&1
+          apiVersion: documentdb.io/preview
+          kind: DocumentDB
+          metadata:
+            name: ${{ env.DB_NAME }}
+            namespace: ${{ env.DB_NS }}
+          spec:
+            nodeCount: 1
+            instancesPerNode: 1
+            resource:
+              storage:
+                pvcSize: 5Gi
+                storageClass: csi-hostpath-sc
+            exposeViaService:
+              serviceType: ClusterIP
+          EOF
+          )"
+          APPLY_RC=$?
+          set -e
+
+          echo "kubectl apply exit code: ${APPLY_RC}"
+          echo "kubectl apply output:"
+          echo "${APPLY_OUTPUT}"
+
+          if [ "${APPLY_RC}" -eq 0 ]; then
+            echo "❌ Expected DocumentDB creation to be rejected, but it was admitted."
+            kubectl delete documentdb ${{ env.DB_NAME }} -n ${{ env.DB_NS }} --ignore-not-found
+            exit 1
+          fi
+          if ! echo "${APPLY_OUTPUT}" | grep -qi "ImageVolume"; then
+            echo "❌ Rejected, but not for the expected ImageVolume reason."
+            exit 1
+          fi
+          echo "✓ DocumentDB creation was correctly blocked with an ImageVolume error."
+
+      - name: Collect cluster diagnostics
+        if: failure()
+        uses: ./.github/actions/collect-logs
+        with:
+          architecture: amd64
+          operator-namespace: ${{ env.OPERATOR_NS }}
+          db-namespace: ${{ env.DB_NS }}
+          db-name: ${{ env.DB_NAME }}
+
+      - name: Upload diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: imagevolume-block-logs-${{ github.run_attempt }}
+          path: |
             /tmp/cluster-logs/
           if-no-files-found: ignore
           retention-days: 14

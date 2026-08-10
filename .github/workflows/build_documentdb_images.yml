@@ -10,9 +10,9 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Released DocumentDB version to package (for example 0.110.0)'
+        description: 'Released DocumentDB version to package (for example 0.113.0)'
         required: false
-        default: '0.110.0'
+        default: '0.113.0'
       documentdb_extension_github_repo:
         description: 'GitHub owner/repo for DocumentDB extension releases'
         required: false
@@ -32,7 +32,7 @@ permissions:
 
 env:
 
-  DEFAULT_DOCUMENTDB_VERSION: '0.110.0'
+  DEFAULT_DOCUMENTDB_VERSION: '0.113.0'
   DOCUMENTDB_EXTENSION_GITHUB_REPO: ${{ github.event.inputs.documentdb_extension_github_repo || 'documentdb/documentdb' }}
   DOCUMENTDB_GATEWAY_IMAGE_REPO: ${{ github.event.inputs.documentdb_gateway_image_repo || 'ghcr.io/documentdb/documentdb/documentdb-local' }}
 
@@ -61,17 +61,19 @@ jobs:
           VERSION="$RAW_VERSION"
         fi
         if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-          echo "Version must use dotted semver format (for example 0.110.0), got: $RAW_VERSION" >&2
+          echo "Version must use dotted semver format (for example 0.113.0), got: $RAW_VERSION" >&2
           exit 1
         fi
         VERSION_DASH=$(echo "$VERSION" | sed -E 's/^([0-9]+\.[0-9]+)\.([0-9]+)$/\1-\2/')
         SHORT_SHA=$(echo "$GITHUB_SHA" | cut -c1-7)
         IMAGE_TAG="${VERSION}-build-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${SHORT_SHA}"
         GATEWAY_SOURCE_IMAGE="${{ env.DOCUMENTDB_GATEWAY_IMAGE_REPO }}:pg17-${VERSION}"
-        echo "documentdb_version=$VERSION" >> $GITHUB_OUTPUT
-        echo "documentdb_version_dash=$VERSION_DASH" >> $GITHUB_OUTPUT
-        echo "image_tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
-        echo "gateway_source_image=$GATEWAY_SOURCE_IMAGE" >> $GITHUB_OUTPUT
+        {
+          echo "documentdb_version=$VERSION"
+          echo "documentdb_version_dash=$VERSION_DASH"
+          echo "image_tag=$IMAGE_TAG"
+          echo "gateway_source_image=$GATEWAY_SOURCE_IMAGE"
+        } >> "$GITHUB_OUTPUT"
         echo "DocumentDB version: $VERSION"
         echo "Release tag: v$VERSION_DASH"
         echo "Candidate image tag: $IMAGE_TAG"
@@ -214,14 +216,16 @@ jobs:
     steps:
     - name: Summary
       run: |
-        echo "## DocumentDB Image Build Summary" >> $GITHUB_STEP_SUMMARY
-        echo "" >> $GITHUB_STEP_SUMMARY
-        echo "- **DocumentDB Version**: \`${{ needs.resolve-public-artifacts.outputs.documentdb_version }}\`" >> $GITHUB_STEP_SUMMARY
-        echo "- **Candidate Image Tag**: \`${{ needs.resolve-public-artifacts.outputs.image_tag }}\`" >> $GITHUB_STEP_SUMMARY
-        echo "- **Extension Package Source**: \`https://github.com/${{ env.DOCUMENTDB_EXTENSION_GITHUB_REPO }}/releases/download/v${{ needs.resolve-public-artifacts.outputs.documentdb_version_dash }}/deb13-postgresql-18-documentdb_${{ needs.resolve-public-artifacts.outputs.documentdb_version_dash }}_{amd64,arm64}.deb\`" >> $GITHUB_STEP_SUMMARY
-        echo "- **Gateway Source Image**: \`${{ needs.resolve-public-artifacts.outputs.gateway_source_image }}\`" >> $GITHUB_STEP_SUMMARY
-        echo "- **Images**: documentdb, gateway" >> $GITHUB_STEP_SUMMARY
-        echo "" >> $GITHUB_STEP_SUMMARY
-        echo "To release these images, run \`release_documentdb_images.yml\` with:" >> $GITHUB_STEP_SUMMARY
-        echo "- candidate_version: \`${{ needs.resolve-public-artifacts.outputs.image_tag }}\`" >> $GITHUB_STEP_SUMMARY
-        echo "- version: \`${{ needs.resolve-public-artifacts.outputs.documentdb_version }}\`" >> $GITHUB_STEP_SUMMARY
+        {
+          echo "## DocumentDB Image Build Summary"
+          echo ""
+          echo "- **DocumentDB Version**: \`${{ needs.resolve-public-artifacts.outputs.documentdb_version }}\`"
+          echo "- **Candidate Image Tag**: \`${{ needs.resolve-public-artifacts.outputs.image_tag }}\`"
+          echo "- **Extension Package Source**: \`https://github.com/${{ env.DOCUMENTDB_EXTENSION_GITHUB_REPO }}/releases/download/v${{ needs.resolve-public-artifacts.outputs.documentdb_version_dash }}/deb13-postgresql-18-documentdb_${{ needs.resolve-public-artifacts.outputs.documentdb_version_dash }}_{amd64,arm64}.deb\`"
+          echo "- **Gateway Source Image**: \`${{ needs.resolve-public-artifacts.outputs.gateway_source_image }}\`"
+          echo "- **Images**: documentdb, gateway"
+          echo ""
+          echo "To release these images, run \`release_documentdb_images.yml\` with:"
+          echo "- candidate_version: \`${{ needs.resolve-public-artifacts.outputs.image_tag }}\`"
+          echo "- version: \`${{ needs.resolve-public-artifacts.outputs.documentdb_version }}\`"
+        } >> "$GITHUB_STEP_SUMMARY"

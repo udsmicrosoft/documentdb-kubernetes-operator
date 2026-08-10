@@ -32,14 +32,10 @@ const (
 	DOCUMENTDB_EXTENSION_IMAGE_REPO = "ghcr.io/documentdb/documentdb-kubernetes-operator/documentdb"
 	GATEWAY_IMAGE_REPO              = "ghcr.io/documentdb/documentdb-kubernetes-operator/gateway"
 
-	// MinK8sMinorVersion is the minimum required Kubernetes minor version.
-	// The operator requires K8s 1.35+ for ImageVolume GA support.
-	MinK8sMinorVersion = 35
-
 	// DEFAULT_DOCUMENTDB_IMAGE is the extension image used in ImageVolume mode.
-	DEFAULT_DOCUMENTDB_IMAGE = DOCUMENTDB_EXTENSION_IMAGE_REPO + ":0.110.0"
+	DEFAULT_DOCUMENTDB_IMAGE = DOCUMENTDB_EXTENSION_IMAGE_REPO + ":0.113.0"
 	// NOTE: Keep in sync with operator/cnpg-plugins/sidecar-injector/internal/config/config.go:applyDefaults()
-	DEFAULT_GATEWAY_IMAGE                 = GATEWAY_IMAGE_REPO + ":0.110.0"
+	DEFAULT_GATEWAY_IMAGE                 = GATEWAY_IMAGE_REPO + ":0.113.0"
 	DEFAULT_DOCUMENTDB_CREDENTIALS_SECRET = "documentdb-credentials"
 	DEFAULT_OTEL_COLLECTOR_IMAGE          = "otel/opentelemetry-collector-contrib:0.149.0"
 

@@ -77,6 +77,14 @@ inputs:
     description: 'Kubernetes version for Kind cluster (e.g., v1.35.0, v1.34.0)'
     required: false
     default: 'v1.35.0'
+  kind-feature-gates:
+    description: 'Comma-separated list of Kubernetes feature gates to set on the kind cluster (apiserver + kubelet). Each entry is "Name" (defaults to true) or "Name=true"/"Name=false", e.g. "ImageVolume" or "ImageVolume=false". Empty means use cluster defaults.'
+    required: false
+    default: ''
+  deploy-documentdb:
+    description: 'Whether the action should deploy a DocumentDB and wait for it to become Healthy as part of setup. Set to "false" to provision only the cluster + operator and let the caller create its own resources (e.g. to assert a webhook rejection).'
+    required: false
+    default: 'true'
   released-chart-version:
     description: 'Install operator from the public GHCR OCI Helm chart instead of built artifacts. Use "latest" to resolve the highest stable SemVer tag published to GHCR, or pass an explicit version (e.g. "0.2.0") for reproducible installs (recommended).'
     required: false
@@ -217,12 +225,43 @@ runs:
         mongosh --version
         echo "✓ mongosh installed successfully for ${{ inputs.architecture }}"
 
+    - name: Generate kind config (feature gates)
+      id: kind-config
+      if: inputs.kind-feature-gates != ''
+      shell: bash
+      run: |
+        # Set the requested feature gates on every control-plane and node
+        # component. A top-level featureGates block in the kind config applies
+        # to the apiserver, controller-manager, scheduler, and kubelet -- which
+        # is what beta features (e.g. ImageVolume before its 1.35 GA) require to
+        # deterministically enable ("Name=true") or disable ("Name=false"),
+        # independent of the version's default.
+        CONFIG_PATH="${RUNNER_TEMP}/kind-feature-gates-config.yaml"
+        {
+          echo "kind: Cluster"
+          echo "apiVersion: kind.x-k8s.io/v1alpha4"
+          echo "featureGates:"
+          IFS=',' read -ra GATES <<< "${{ inputs.kind-feature-gates }}"
+          for entry in "${GATES[@]}"; do
+            entry="$(echo "$entry" | xargs)"  # trim whitespace
+            [ -z "$entry" ] && continue
+            name="${entry%%=*}"
+            value="true"
+            [ "$entry" != "$name" ] && value="${entry#*=}"
+            echo "  ${name}: ${value}"
+          done
+        } > "$CONFIG_PATH"
+        echo "path=$CONFIG_PATH" >> "$GITHUB_OUTPUT"
+        echo "Generated kind config setting feature gates: ${{ inputs.kind-feature-gates }}"
+        cat "$CONFIG_PATH"
+
     - name: Create kind cluster
       uses: helm/kind-action@v1.12.0
       with:
         version: v0.31.0
         node_image: kindest/node:${{ inputs.kubernetes-version }}
         cluster_name: documentdb-${{ inputs.test-type }}-${{ inputs.architecture }}-${{ inputs.test-scenario-name }}
+        config: ${{ steps.kind-config.outputs.path }}
 
     - name: Resolve DocumentDB and Gateway image references
       shell: bash
@@ -722,6 +761,7 @@ runs:
         echo "✓ DocumentDB credentials secret created successfully"
 
     - name: Deploy DocumentDB cluster
+      if: inputs.deploy-documentdb == 'true'
       shell: bash
       run: |
         echo "Deploying DocumentDB cluster on ${{ inputs.architecture }} architecture..."

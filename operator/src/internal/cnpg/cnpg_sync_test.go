@@ -50,7 +50,7 @@ func baseCluster(name, namespace string) *cnpgv1.Cluster {
 					{
 						Name: "documentdb",
 						ImageVolumeSource: corev1.ImageVolumeSource{
-							Reference: "ghcr.io/documentdb/documentdb:0.110.0",
+							Reference: "ghcr.io/documentdb/documentdb:0.113.0",
 						},
 					},
 				},
@@ -65,7 +65,7 @@ func baseCluster(name, namespace string) *cnpgv1.Cluster {
 					Name:    util.DEFAULT_SIDECAR_INJECTOR_PLUGIN,
 					Enabled: pointer.Bool(true),
 					Parameters: map[string]string{
-						"gatewayImage":               "ghcr.io/documentdb/gateway:0.110.0",
+						"gatewayImage":               "ghcr.io/documentdb/gateway:0.113.0",
 						"documentDbCredentialSecret": "documentdb-credentials",
 					},
 				},
@@ -90,7 +90,7 @@ var _ = Describe("SyncCnpgCluster", func() {
 	It("detects extension image changes", func() {
 		current := baseCluster("test-cluster", namespace)
 		desired := current.DeepCopy()
-		desired.Spec.PostgresConfiguration.Extensions[0].ImageVolumeSource.Reference = "ghcr.io/documentdb/documentdb:0.110.0"
+		desired.Spec.PostgresConfiguration.Extensions[0].ImageVolumeSource.Reference = "ghcr.io/documentdb/documentdb:0.113.0"
 
 		c := buildFakeClient(current).Build()
 		err := SyncCnpgCluster(context.Background(), c, current, desired, nil)
@@ -99,13 +99,13 @@ var _ = Describe("SyncCnpgCluster", func() {
 
 		updated := &cnpgv1.Cluster{}
 		Expect(c.Get(context.Background(), types.NamespacedName{Name: "test-cluster", Namespace: namespace}, updated)).To(Succeed())
-		Expect(updated.Spec.PostgresConfiguration.Extensions[0].ImageVolumeSource.Reference).To(Equal("ghcr.io/documentdb/documentdb:0.110.0"))
+		Expect(updated.Spec.PostgresConfiguration.Extensions[0].ImageVolumeSource.Reference).To(Equal("ghcr.io/documentdb/documentdb:0.113.0"))
 	})
 
 	It("detects gateway image changes", func() {
 		current := baseCluster("test-cluster", namespace)
 		desired := current.DeepCopy()
-		desired.Spec.Plugins[0].Parameters["gatewayImage"] = "ghcr.io/documentdb/gateway:0.110.0"
+		desired.Spec.Plugins[0].Parameters["gatewayImage"] = "ghcr.io/documentdb/gateway:0.113.0"
 
 		c := buildFakeClient(current).Build()
 		err := SyncCnpgCluster(context.Background(), c, current, desired, nil)
@@ -114,7 +114,7 @@ var _ = Describe("SyncCnpgCluster", func() {
 
 		updated := &cnpgv1.Cluster{}
 		Expect(c.Get(context.Background(), types.NamespacedName{Name: "test-cluster", Namespace: namespace}, updated)).To(Succeed())
-		Expect(updated.Spec.Plugins[0].Parameters["gatewayImage"]).To(Equal("ghcr.io/documentdb/gateway:0.110.0"))
+		Expect(updated.Spec.Plugins[0].Parameters["gatewayImage"]).To(Equal("ghcr.io/documentdb/gateway:0.113.0"))
 	})
 
 	It("patches plugin parameters (TLS secret sync)", func() {
@@ -171,8 +171,8 @@ var _ = Describe("SyncCnpgCluster", func() {
 	It("does not add restart annotation when extension image changes", func() {
 		current := baseCluster("test-cluster", namespace)
 		desired := current.DeepCopy()
-		desired.Spec.PostgresConfiguration.Extensions[0].ImageVolumeSource.Reference = "ghcr.io/documentdb/documentdb:0.110.0"
-		desired.Spec.Plugins[0].Parameters["gatewayImage"] = "ghcr.io/documentdb/gateway:0.110.0"
+		desired.Spec.PostgresConfiguration.Extensions[0].ImageVolumeSource.Reference = "ghcr.io/documentdb/documentdb:0.113.0"
+		desired.Spec.Plugins[0].Parameters["gatewayImage"] = "ghcr.io/documentdb/gateway:0.113.0"
 
 		c := buildFakeClient(current).Build()
 		err := SyncCnpgCluster(context.Background(), c, current, desired, nil)
@@ -181,8 +181,8 @@ var _ = Describe("SyncCnpgCluster", func() {
 
 		updated := &cnpgv1.Cluster{}
 		Expect(c.Get(context.Background(), types.NamespacedName{Name: "test-cluster", Namespace: namespace}, updated)).To(Succeed())
-		Expect(updated.Spec.PostgresConfiguration.Extensions[0].ImageVolumeSource.Reference).To(Equal("ghcr.io/documentdb/documentdb:0.110.0"))
-		Expect(updated.Spec.Plugins[0].Parameters["gatewayImage"]).To(Equal("ghcr.io/documentdb/gateway:0.110.0"))
+		Expect(updated.Spec.PostgresConfiguration.Extensions[0].ImageVolumeSource.Reference).To(Equal("ghcr.io/documentdb/documentdb:0.113.0"))
+		Expect(updated.Spec.Plugins[0].Parameters["gatewayImage"]).To(Equal("ghcr.io/documentdb/gateway:0.113.0"))
 		// No restart annotation — CNPG handles restart for extension changes
 		Expect(updated.Annotations).ToNot(HaveKey("kubectl.kubernetes.io/restartedAt"))
 	})
@@ -218,7 +218,7 @@ var _ = Describe("SyncCnpgCluster", func() {
 			{
 				Name: "documentdb",
 				ImageVolumeSource: corev1.ImageVolumeSource{
-					Reference: "ghcr.io/documentdb/documentdb:0.110.0",
+					Reference: "ghcr.io/documentdb/documentdb:0.113.0",
 				},
 			},
 		}
@@ -244,7 +244,7 @@ var _ = Describe("SyncCnpgCluster", func() {
 		current.Spec.Plugins = nil // no plugins in current
 
 		desired := baseCluster("test-cluster", namespace)
-		desired.Spec.Plugins[0].Parameters["gatewayImage"] = "ghcr.io/documentdb/gateway:0.110.0"
+		desired.Spec.Plugins[0].Parameters["gatewayImage"] = "ghcr.io/documentdb/gateway:0.113.0"
 
 		c := buildFakeClient(current).Build()
 		err := SyncCnpgCluster(context.Background(), c, current, desired, nil)
@@ -254,7 +254,7 @@ var _ = Describe("SyncCnpgCluster", func() {
 	It("handles gateway and TLS changes together", func() {
 		current := baseCluster("test-cluster", namespace)
 		desired := current.DeepCopy()
-		desired.Spec.Plugins[0].Parameters["gatewayImage"] = "ghcr.io/documentdb/gateway:0.110.0"
+		desired.Spec.Plugins[0].Parameters["gatewayImage"] = "ghcr.io/documentdb/gateway:0.113.0"
 		desired.Spec.Plugins[0].Parameters["gatewayTLSSecret"] = "new-tls-secret"
 
 		c := buildFakeClient(current).Build()
@@ -263,7 +263,7 @@ var _ = Describe("SyncCnpgCluster", func() {
 
 		updated := &cnpgv1.Cluster{}
 		Expect(c.Get(context.Background(), types.NamespacedName{Name: "test-cluster", Namespace: namespace}, updated)).To(Succeed())
-		Expect(updated.Spec.Plugins[0].Parameters["gatewayImage"]).To(Equal("ghcr.io/documentdb/gateway:0.110.0"))
+		Expect(updated.Spec.Plugins[0].Parameters["gatewayImage"]).To(Equal("ghcr.io/documentdb/gateway:0.113.0"))
 		Expect(updated.Spec.Plugins[0].Parameters["gatewayTLSSecret"]).To(Equal("new-tls-secret"))
 		// Restart annotation because gateway updated (no extension change)
 		Expect(updated.Annotations).To(HaveKey("kubectl.kubernetes.io/restartedAt"))
