@@ -20,7 +20,7 @@ permissions:
   contents: read
 
 env:
-  GO_VERSION: '1.26.5'
+  GO_VERSION: '1.26.6'
 
 jobs:
   unit-test:
@@ -48,14 +48,14 @@ jobs:
 
       - name: Run unit tests
         run: |
-          go test -v -race -timeout 10m \
-            $(go list ./... | grep -v /test/e2e)
+          mapfile -t pkgs < <(go list ./... | grep -v /test/e2e)
+          go test -v -race -timeout 10m "${pkgs[@]}"
 
       - name: Test Summary
         if: always()
         run: |
-          echo "## Unit Test Results" >> $GITHUB_STEP_SUMMARY
-          echo "✅ Unit tests completed" >> $GITHUB_STEP_SUMMARY
+          echo "## Unit Test Results" >> "$GITHUB_STEP_SUMMARY"
+          echo "✅ Unit tests completed" >> "$GITHUB_STEP_SUMMARY"
 
   helm-chart-tests:
     name: Helm Chart Unit Tests
@@ -81,5 +81,5 @@ jobs:
       - name: Test Summary
         if: always()
         run: |
-          echo "## Helm Chart Test Results" >> $GITHUB_STEP_SUMMARY
-          echo "✅ Helm chart unit tests completed" >> $GITHUB_STEP_SUMMARY
+          echo "## Helm Chart Test Results" >> "$GITHUB_STEP_SUMMARY"
+          echo "✅ Helm chart unit tests completed" >> "$GITHUB_STEP_SUMMARY"

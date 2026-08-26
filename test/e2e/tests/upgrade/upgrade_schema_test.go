@@ -69,15 +69,63 @@ var _ = Describe("DocumentDB upgrade — schema",
 			newVersion string
 			ctx        context.Context
 			cancel     context.CancelFunc
+			ns         string
+			key        types.NamespacedName
 		)
 
+		// The cluster is created once in BeforeAll and shared by the ordered
+		// specs below: the happy-path two-phase upgrade, then the
+		// unpullable-version recovery check. Both run against the same
+		// DocumentDB so we don't pay for a second cluster.
 		BeforeAll(func() {
+			// Gate the expensive shared setup at the suite level *before* any
+			// cluster work: BeforeAll runs ahead of BeforeEach, so without this
+			// a sub-High run (e.g. a local run without label filtering) would
+			// pay the full cluster creation here and then skip every It.
+			e2e.SkipUnlessLevel(e2e.High)
 			skipUnlessUpgradeEnabled()
 			oldVersion = envOr(envOldDocumentDBVersion, defaultOldDocumentDBVersion)
 			newVersion = envOr(envNewDocumentDBVersion, defaultNewDocumentDBVersion)
 			if oldVersion == newVersion {
 				Skip(envOldDocumentDBVersion + " and " + envNewDocumentDBVersion + " are identical; nothing to upgrade")
 			}
+
+			env := e2e.SuiteEnv()
+			Expect(env).NotTo(BeNil(), "SuiteEnv must be initialized by SetupSuite")
+			c := env.Client
+
+			setupCtx, setupCancel := context.WithTimeout(context.Background(), imageRolloutTimeout)
+			DeferCleanup(func() { setupCancel() })
+
+			By("creating a DocumentDB pinned to the old version (schemaVersion unset → two-phase)")
+			ns = namespaces.NamespaceForSpec(e2e.UpgradeLabel)
+			createNamespace(setupCtx, c, ns)
+			createCredentialSecret(setupCtx, c, ns)
+
+			vars := baseVars(ddName, ns, "2Gi")
+			// Drive the version via documentDBVersion, not raw images: the
+			// mixin sets spec.documentDBVersion, so the base image fields
+			// must stay empty for it to take effect.
+			vars["DOCUMENTDB_IMAGE"] = ""
+			vars["GATEWAY_IMAGE"] = ""
+			vars["DOCUMENTDB_VERSION"] = oldVersion
+
+			dd, err := documentdb.Create(setupCtx, c, ns, ddName, documentdb.CreateOptions{
+				Base:          "documentdb",
+				Mixins:        []string{"documentdb_version"},
+				Vars:          vars,
+				ManifestsRoot: manifestsRoot(),
+			})
+			Expect(err).NotTo(HaveOccurred(), "create DocumentDB %s/%s", ns, ddName)
+			DeferCleanup(func(ctx SpecContext) {
+				_ = shareddb.Delete(ctx, c, dd, 3*time.Minute)
+			})
+
+			key = types.NamespacedName{Namespace: ns, Name: ddName}
+			Eventually(assertions.AssertDocumentDBReady(setupCtx, c, key),
+				timeouts.For(timeouts.DocumentDBReady),
+				timeouts.PollInterval(timeouts.DocumentDBReady),
+			).Should(Succeed(), "DocumentDB did not reach Ready on oldVersion=%s", oldVersion)
 		})
 
 		BeforeEach(func() {
@@ -91,36 +139,6 @@ var _ = Describe("DocumentDB upgrade — schema",
 			Expect(env).NotTo(BeNil(), "SuiteEnv must be initialized by SetupSuite")
 			Expect(ctx).NotTo(BeNil(), "BeforeEach must have populated the spec context")
 			c := env.Client
-
-			By("creating a DocumentDB pinned to the old version (schemaVersion unset → two-phase)")
-			ns := namespaces.NamespaceForSpec(e2e.UpgradeLabel)
-			createNamespace(ctx, c, ns)
-			createCredentialSecret(ctx, c, ns)
-
-			vars := baseVars(ddName, ns, "2Gi")
-			// Drive the version via documentDBVersion, not raw images: the
-			// mixin sets spec.documentDBVersion, so the base image fields
-			// must stay empty for it to take effect.
-			vars["DOCUMENTDB_IMAGE"] = ""
-			vars["GATEWAY_IMAGE"] = ""
-			vars["DOCUMENTDB_VERSION"] = oldVersion
-
-			dd, err := documentdb.Create(ctx, c, ns, ddName, documentdb.CreateOptions{
-				Base:          "documentdb",
-				Mixins:        []string{"documentdb_version"},
-				Vars:          vars,
-				ManifestsRoot: manifestsRoot(),
-			})
-			Expect(err).NotTo(HaveOccurred(), "create DocumentDB %s/%s", ns, ddName)
-			DeferCleanup(func(ctx SpecContext) {
-				_ = shareddb.Delete(ctx, c, dd, 3*time.Minute)
-			})
-
-			key := types.NamespacedName{Namespace: ns, Name: ddName}
-			Eventually(assertions.AssertDocumentDBReady(ctx, c, key),
-				timeouts.For(timeouts.DocumentDBReady),
-				timeouts.PollInterval(timeouts.DocumentDBReady),
-			).Should(Succeed(), "DocumentDB did not reach Ready on oldVersion=%s", oldVersion)
 
 			// Single schema-version poller reused across every Eventually/
 			// Consistently below: it caches the last good read so a transient
@@ -209,6 +227,78 @@ var _ = Describe("DocumentDB upgrade — schema",
 			Expect(err).NotTo(HaveOccurred(), "count %s.%s after schema migration", dbName, collName)
 			Expect(n2).To(Equal(int64(seed.SmallDatasetSize)),
 				"seeded document count changed across schema migration")
+		})
+
+		It("does not advance the schema and recovers when patched to an unpullable version", func() {
+			env := e2e.SuiteEnv()
+			Expect(env).NotTo(BeNil(), "SuiteEnv must be initialized by SetupSuite")
+			Expect(ctx).NotTo(BeNil(), "BeforeEach must have populated the spec context")
+			c := env.Client
+
+			// Runs after the happy-path spec (Ordered), so the shared cluster
+			// is at newVersion with the schema finalized. We deliberately use a
+			// version ABOVE the installed schema (0.999.0) so the image-rollback
+			// webhook admits the patch — a version below the installed schema
+			// would instead be rejected at admission (a different guard). The
+			// bogus tag has no published image, so its pods can never pull.
+			//
+			// This shared cluster is single-instance (INSTANCES=1), so a bad
+			// image forces CNPG to recreate the sole pod and the gateway is
+			// briefly unavailable during the failed pull — we therefore do NOT
+			// assert continuous serving here (that HA guarantee is covered by
+			// upgrade_schema_ha_test.go). What we assert instead is the
+			// operator's safety contract: the installed schema must not advance
+			// while the target binary can't start, and the cluster must fully
+			// recover with data intact once the version is rolled back.
+			const bogusVersion = "0.999.0"
+
+			schemaVersion := schemaVersionGetter(ctx, c, key)
+
+			By("confirming the cluster starts this spec Ready at the new version")
+			Eventually(schemaVersion,
+				timeouts.For(timeouts.DocumentDBReady),
+				timeouts.PollInterval(timeouts.DocumentDBReady),
+			).Should(Equal(newVersion), "expected shared cluster to be at schema %s", newVersion)
+
+			By("patching spec.documentDBVersion to an unpullable version")
+			fresh, err := shareddb.Get(ctx, c, key)
+			Expect(err).NotTo(HaveOccurred(), "re-fetch DocumentDB before bad-version patch")
+			Expect(shareddb.PatchSpec(ctx, c, fresh, func(s *previewv1.DocumentDBSpec) {
+				s.DocumentDBVersion = bogusVersion
+			})).To(Succeed(), "patch DocumentDBVersion to unpullable %s", bogusVersion)
+
+			By("verifying the installed schema does not change while the new image cannot be pulled")
+			// The operator cannot run ALTER EXTENSION against a binary that
+			// never starts, so the installed schema must stay at newVersion.
+			Consistently(schemaVersion,
+				30*time.Second, 5*time.Second,
+			).Should(Equal(newVersion),
+				"schema must not advance past %s when the target image is unpullable", newVersion)
+
+			By("rolling the version back to the valid new version and recovering")
+			fresh2, err := shareddb.Get(ctx, c, key)
+			Expect(err).NotTo(HaveOccurred(), "re-fetch DocumentDB before recovery patch")
+			Expect(shareddb.PatchSpec(ctx, c, fresh2, func(s *previewv1.DocumentDBSpec) {
+				s.DocumentDBVersion = newVersion
+			})).To(Succeed(), "restore DocumentDBVersion to %s", newVersion)
+
+			Eventually(assertions.AssertDocumentDBReady(ctx, c, key),
+				timeouts.For(timeouts.DocumentDBUpgrade),
+				timeouts.PollInterval(timeouts.DocumentDBUpgrade),
+			).Should(Succeed(), "DocumentDB did not recover to Ready on %s after the bad-version patch", newVersion)
+
+			By("verifying the schema is still the new version and data survived after recovery")
+			Consistently(schemaVersion,
+				15*time.Second, 5*time.Second,
+			).Should(Equal(newVersion), "schema should remain %s after recovery", newVersion)
+
+			handle2, err := e2emongo.NewFromDocumentDB(ctx, env, ns, ddName)
+			Expect(err).NotTo(HaveOccurred(), "reconnect to DocumentDB gateway after recovery")
+			DeferCleanup(func(ctx SpecContext) { _ = handle2.Close(ctx) })
+			n2, err := sharedmongo.Count(ctx, handle2.Client(), dbName, collName, bson.M{})
+			Expect(err).NotTo(HaveOccurred(), "count %s.%s after recovery", dbName, collName)
+			Expect(n2).To(Equal(int64(seed.SmallDatasetSize)),
+				"seeded document count changed across the failed-upgrade/recovery cycle")
 		})
 	})
 

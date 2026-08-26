@@ -1,0 +1,12 @@
+apiVersion: documentdb.io/preview
+kind: DocumentDB
+metadata:
+  name: ${NAME}
+  namespace: ${NAMESPACE}
+spec:
+  # Desired extension schema version. Set to "auto" to let the operator run
+  # ALTER EXTENSION UPDATE automatically whenever the binary is upgraded
+  # (single-step path), or to an explicit semver to finalize a specific
+  # version. Left empty (line dropped by envsubst) the base stays in
+  # two-phase mode.
+  schemaVersion: ${SCHEMA_VERSION}

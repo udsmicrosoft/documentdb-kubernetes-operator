@@ -16,6 +16,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/documentdb/documentdb-operator/test/longhaul/backup"
 	"github.com/documentdb/documentdb-operator/test/longhaul/config"
 	"github.com/documentdb/documentdb-operator/test/longhaul/journal"
 	"github.com/documentdb/documentdb-operator/test/longhaul/monitor"
@@ -132,8 +133,19 @@ func run(cfg config.Config) int {
 	// Start verifier. A single verifier is sufficient — see StartVerifier
 	// godoc. Writers are passed so the verifier can detect tail loss by
 	// comparing each writer's acked tip against what's in the DB.
-	workload.StartVerifier(ctx, db, writers, metrics, j)
+	verifier := workload.StartVerifier(ctx, db, writers, metrics, j)
 	j.Info("main", "verifier started")
+
+	// Start retention pruner (bounds the workload collection so an unbounded
+	// write test cannot eventually exhaust the PVC). It prunes only documents
+	// below the verifier's confirmed floor, so it never affects the durability
+	// verdict. Disabled when RetainPerWriter == 0.
+	if cfg.RetainPerWriter > 0 {
+		workload.StartPruner(ctx, db.Collection(workload.CollectionName), writers, verifier, cfg.RetainPerWriter, metrics, j)
+		j.Info("main", "retention pruner started")
+	} else {
+		j.Info("main", "retention pruning disabled (LONGHAUL_RETAIN_PER_WRITER=0)")
+	}
 
 	// Configure operations.
 	ops := []operations.Operation{
@@ -146,12 +158,34 @@ func run(cfg config.Config) int {
 	scheduler := operations.NewScheduler(ops, healthMon, j, cfg.OpCooldown)
 	go scheduler.Run(ctx)
 
+	// Start data-protection verifier (ScheduledBackup + retention). Runs
+	// concurrently with the scheduler by design — backup is deliberately not
+	// isolated from topology/chaos operations.
+	backupMetrics := backup.NewMetrics()
+	if cfg.BackupEnabled {
+		verifier := backup.NewVerifier(clusterClient, j, backupMetrics, backup.Config{
+			ScheduledBackupName: cfg.ClusterName + "-longhaul",
+			Schedule:            cfg.BackupSchedule,
+			RetentionDays:       cfg.BackupRetentionDays,
+			VerifyInterval:      cfg.BackupVerifyInterval,
+		})
+		if err := verifier.Bootstrap(ctx); err != nil {
+			// A bootstrap failure is not fatal to the whole run — the workload
+			// and other operations still provide signal. Surface it loudly.
+			j.Error("backup", fmt.Sprintf("ScheduledBackup bootstrap failed, backup verification disabled: %v", err))
+		} else {
+			go verifier.Run(ctx)
+		}
+	} else {
+		j.Info("backup", "backup verification disabled via config")
+	}
+
 	// Start metrics sampling goroutine (feeds leak detector).
 	go runMetricsSampling(ctx, clusterClient, leakDetector, j)
 
 	// Start periodic checkpoint reporter.
 	summaryFunc := func() report.Summary {
-		return buildSummary(metrics, leakDetector, scheduler, j)
+		return buildSummary(metrics, backupMetrics, leakDetector, scheduler, j)
 	}
 	reporter := report.NewCheckpointReporter(k8sClientset, cfg.Namespace, cfg.ReportInterval, summaryFunc)
 	go reporter.Run(ctx)
@@ -169,7 +203,7 @@ func run(cfg config.Config) int {
 	// here (before os.Exit) so the authoritative verdict reaches the source
 	// of truth that operators consult — the Run() goroutine cannot do this
 	// reliably because os.Exit can kill it mid-Update.
-	summary := buildSummary(metrics, leakDetector, scheduler, j)
+	summary := buildSummary(metrics, backupMetrics, leakDetector, scheduler, j)
 	markdown := report.GenerateMarkdown(summary)
 	fmt.Println("\n" + markdown)
 	reporter.EmitFinal()
@@ -187,30 +221,43 @@ func run(cfg config.Config) int {
 }
 
 // buildSummary constructs a report.Summary from current state.
-func buildSummary(metrics *workload.Metrics, leakDetector *monitor.LeakDetector, scheduler *operations.Scheduler, j *journal.Journal) report.Summary {
+func buildSummary(metrics *workload.Metrics, backupMetrics *backup.Metrics, leakDetector *monitor.LeakDetector, scheduler *operations.Scheduler, j *journal.Journal) report.Summary {
 	snap := metrics.Snapshot()
+	backupSnap := backupMetrics.Snapshot()
 	leakAnalysis := leakDetector.Analyze()
 
 	result := report.ResultPass
 	failReason := ""
 
-	if snap.HasDataLoss() {
-		result = report.ResultFail
-		failReason = fmt.Sprintf("data loss: %d gaps, %d checksum errors",
-			snap.GapsDetected, snap.ChecksumErrors)
-	}
-	if j.HasPolicyViolation() {
+	appendReason := func(msg string) {
 		result = report.ResultFail
 		if failReason != "" {
 			failReason += "; "
 		}
-		failReason += "outage policy violated"
+		failReason += msg
+	}
+
+	if snap.HasDataLoss() {
+		appendReason(fmt.Sprintf("data loss: %d gaps, %d checksum errors",
+			snap.GapsDetected, snap.ChecksumErrors))
+	}
+	if j.HasPolicyViolation() {
+		appendReason("outage policy violated")
+	}
+	if backupSnap.HasRetentionLeak() {
+		appendReason(fmt.Sprintf("backup retention leak: %d expired backups not collected",
+			backupSnap.RetentionLeaks))
+	}
+	if backupSnap.HasCompletionStall() {
+		appendReason(fmt.Sprintf("backup completion stalled: %d backups scheduled with no completion",
+			backupSnap.MaxScheduledWithoutCompletion))
 	}
 
 	return report.Summary{
 		Result:       result,
 		Duration:     snap.Elapsed,
 		Metrics:      snap,
+		Backup:       backupSnap,
 		LeakAnalysis: leakAnalysis,
 		OpsExecuted:  scheduler.OpsExecuted(),
 		Windows:      j.DisruptionWindows(),

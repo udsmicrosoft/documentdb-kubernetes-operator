@@ -14,7 +14,7 @@ permissions:
   pull-requests: write
 
 env:
-  GO_VERSION: '1.26.5'
+  GO_VERSION: '1.26.6'
 
 jobs:
   coverage:
@@ -41,12 +41,13 @@ jobs:
 
       - name: Run unit tests with coverage
         run: |
+          mapfile -t pkgs < <(go list ./... | grep -v /test/e2e)
           go test -coverprofile=coverage.out -covermode=atomic \
             -coverpkg=./... \
-            $(go list ./... | grep -v /test/e2e)
-          
-          echo "## Coverage Summary" >> $GITHUB_STEP_SUMMARY
-          go tool cover -func=coverage.out | tail -1 >> $GITHUB_STEP_SUMMARY
+            "${pkgs[@]}"
+
+          echo "## Coverage Summary" >> "$GITHUB_STEP_SUMMARY"
+          go tool cover -func=coverage.out | tail -1 >> "$GITHUB_STEP_SUMMARY"
 
       - name: Check diff coverage (newly added lines must have >= 90% coverage)
         run: |
@@ -60,14 +61,14 @@ jobs:
           git diff -U0 --no-color --relative origin/${{ github.base_ref }} -- '*.go' ':!**/zz_generated.*.go' > patch.diff
 
           # Run patch coverage analysis with JSON output
-          RESULT=$($(go env GOPATH)/bin/go-patch-cover -o json coverage.out patch.diff)
+          RESULT=$("$(go env GOPATH)"/bin/go-patch-cover -o json coverage.out patch.diff)
           echo "$RESULT" | jq .
 
           # Extract patch coverage percentage
           PATCH_COV=$(echo "$RESULT" | jq -r '.patch_coverage')
           PATCH_STMTS=$(echo "$RESULT" | jq -r '.patch_num_stmt')
           echo "Patch coverage: ${PATCH_COV}% (${PATCH_STMTS} changed statements)"
-          echo "## Diff Coverage: ${PATCH_COV}%" >> $GITHUB_STEP_SUMMARY
+          echo "## Diff Coverage: ${PATCH_COV}%" >> "$GITHUB_STEP_SUMMARY"
 
           # Enforce threshold (skip if no changed statements)
           THRESHOLD=90

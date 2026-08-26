@@ -32,9 +32,24 @@ const (
 	// Observability and reporting.
 	EnvReportInterval = "LONGHAUL_REPORT_INTERVAL"
 
+	// Data protection (ScheduledBackup + retention verification).
+	EnvBackupEnabled        = "LONGHAUL_BACKUP_ENABLED"
+	EnvBackupSchedule       = "LONGHAUL_BACKUP_SCHEDULE"
+	EnvBackupRetentionDays  = "LONGHAUL_BACKUP_RETENTION_DAYS"
+	EnvBackupVerifyInterval = "LONGHAUL_BACKUP_VERIFY_INTERVAL"
+
 	// Operational toggles.
 	EnvResetData = "LONGHAUL_RESET_DATA"
+
+	// Data retention. Bounds the workload collection so an unbounded write
+	// test does not eventually exhaust the PVC.
+	EnvRetainPerWriter = "LONGHAUL_RETAIN_PER_WRITER"
 )
+
+// DefaultRetainPerWriter is the default number of most-recent documents kept
+// per writer when pruning is enabled. At ~10 writes/sec/writer this retains
+// roughly 55 hours of history per writer while bounding steady-state disk use.
+const DefaultRetainPerWriter = 2_000_000
 
 // Config holds all configuration for a long haul test run.
 type Config struct {
@@ -73,10 +88,31 @@ type Config struct {
 	// ReportInterval is how often checkpoint reports are generated.
 	ReportInterval time.Duration
 
+	// BackupEnabled controls whether the ScheduledBackup + retention
+	// verifier runs. Default true.
+	BackupEnabled bool
+
+	// BackupSchedule is the cron expression for the canary ScheduledBackup.
+	BackupSchedule string
+
+	// BackupRetentionDays is the retention window applied to child backups
+	// and used to derive the retention-leak deadline.
+	BackupRetentionDays int
+
+	// BackupVerifyInterval is how often the backup verifier samples state.
+	// The 5m default suits a multi-day run; short bounded runs (e.g. the smoke
+	// gate) lower it so the periodic loop fires several times in the window.
+	BackupVerifyInterval time.Duration
+
 	// ResetData controls whether the workload collection is dropped on startup.
 	// Default false so that pod restarts preserve durability history; opt in
 	// for fresh local/dev iterations.
 	ResetData bool
+
+	// RetainPerWriter is the number of most-recent documents kept per writer.
+	// Older, already-verified documents are pruned to bound disk usage. Zero
+	// disables pruning (unbounded growth — the pre-retention behavior).
+	RetainPerWriter int64
 }
 
 // DefaultConfig returns a Config with safe defaults for local development.
@@ -93,6 +129,13 @@ func DefaultConfig() Config {
 		MinInstances:    1,
 		MaxInstances:    3,
 		ReportInterval:  1 * time.Hour,
+
+		BackupEnabled:        true,
+		BackupSchedule:       "0 */6 * * *",
+		BackupRetentionDays:  1,
+		BackupVerifyInterval: 5 * time.Minute,
+
+		RetainPerWriter: DefaultRetainPerWriter,
 	}
 }
 
@@ -177,8 +220,40 @@ func LoadFromEnv() (Config, error) {
 		cfg.ReportInterval = d
 	}
 
+	if v := strings.TrimSpace(strings.ToLower(os.Getenv(EnvBackupEnabled))); v != "" {
+		cfg.BackupEnabled = v == "true" || v == "1" || v == "yes"
+	}
+
+	if v := os.Getenv(EnvBackupSchedule); v != "" {
+		cfg.BackupSchedule = v
+	}
+
+	if v := os.Getenv(EnvBackupRetentionDays); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return cfg, fmt.Errorf("invalid %s=%q: %w", EnvBackupRetentionDays, v, err)
+		}
+		cfg.BackupRetentionDays = n
+	}
+
+	if v := os.Getenv(EnvBackupVerifyInterval); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return cfg, fmt.Errorf("invalid %s=%q: %w", EnvBackupVerifyInterval, v, err)
+		}
+		cfg.BackupVerifyInterval = d
+	}
+
 	if v := strings.TrimSpace(strings.ToLower(os.Getenv(EnvResetData))); v != "" {
 		cfg.ResetData = v == "true" || v == "1" || v == "yes"
+	}
+
+	if v := os.Getenv(EnvRetainPerWriter); v != "" {
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			return cfg, fmt.Errorf("invalid %s=%q: %w", EnvRetainPerWriter, v, err)
+		}
+		cfg.RetainPerWriter = n
 	}
 
 	return cfg, nil
@@ -212,6 +287,20 @@ func (c *Config) Validate() error {
 	}
 	if c.MaxInstances < c.MinInstances {
 		return fmt.Errorf("max instances (%d) must be >= min instances (%d)", c.MaxInstances, c.MinInstances)
+	}
+	if c.BackupEnabled {
+		if c.BackupSchedule == "" {
+			return fmt.Errorf("backup schedule must not be empty when backups are enabled")
+		}
+		if c.BackupRetentionDays < 1 {
+			return fmt.Errorf("backup retention days must be at least 1, got %d", c.BackupRetentionDays)
+		}
+		if c.BackupVerifyInterval <= 0 {
+			return fmt.Errorf("backup verify interval must be positive, got %s", c.BackupVerifyInterval)
+		}
+	}
+	if c.RetainPerWriter < 0 {
+		return fmt.Errorf("retain per writer must not be negative, got %d", c.RetainPerWriter)
 	}
 	return nil
 }
