@@ -1,0 +1,52 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+apiVersion: documentdb.io/preview
+kind: DocumentDB
+metadata:
+  name: pgsentinel-demo
+spec:
+  nodeCount: 1
+  instancesPerNode: 1
+  resource:
+    storage:
+      pvcSize: 10Gi
+  monitoring:
+    enabled: true
+    exporter:
+      prometheus:
+        port: 8888
+      traceFile: true
+  postgres:
+    extensions:
+      - name: pgsentinel
+        image:
+          reference: registry.example.com/pgsentinel:1.5.1-pg18-trixie
+          pullPolicy: IfNotPresent
+        dynamic_library_path: [lib]
+        extension_control_path: [share]
+    sharedPreloadLibraries: [pgsentinel]
+    parameters:
+      pg_stat_statements.track: all
+      track_activity_query_size: "2048"
+      pgsentinel.db_name: documentdb_diagnostics
+      pgsentinel_ash.sampling_period: "1"
+      pgsentinel_ash.max_entries: "1000"
+      pgsentinel_ash.track_idle_trans: "off"
+      pgsentinel_pgssh.enable: "on"
+      pgsentinel_pgssh.max_entries: "10000"
+---
+apiVersion: postgresql.cnpg.io/v1
+kind: Database
+metadata:
+  name: pgsentinel-demo-diagnostics
+spec:
+  name: documentdb_diagnostics
+  owner: postgres
+  cluster:
+    name: pgsentinel-demo
+  extensions:
+    - name: pgsentinel
+      ensure: present
+      version: "1.5.1"
+      schema: public

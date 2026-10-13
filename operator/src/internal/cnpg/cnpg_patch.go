@@ -46,6 +46,8 @@ const (
 	PatchPathAffinity           = "/spec/affinity"
 	PatchPathMaxStopDelay       = "/spec/stopDelay"
 	PatchPathPostgresParameters = "/spec/postgresql/parameters"
+	PatchPathExtensions         = "/spec/postgresql/extensions"
+	PatchPathPreloadLibraries   = "/spec/postgresql/shared_preload_libraries"
 	PatchPathPgHBA              = "/spec/postgresql/pg_hba"
 	PatchPathResources          = "/spec/resources"
 

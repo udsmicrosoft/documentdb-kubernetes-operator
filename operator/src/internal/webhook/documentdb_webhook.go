@@ -22,6 +22,7 @@ import (
 
 	dbpreview "github.com/documentdb/documentdb-operator/api/preview"
 	"github.com/documentdb/documentdb-operator/internal/cnpg"
+	otelcfg "github.com/documentdb/documentdb-operator/internal/otel"
 	"github.com/documentdb/documentdb-operator/internal/product"
 	util "github.com/documentdb/documentdb-operator/internal/utils"
 )
@@ -108,6 +109,9 @@ func (v *DocumentDBValidator) validate(db *dbpreview.DocumentDB) (allErrs field.
 	validations := []validationFunc{
 		v.validateSchemaVersionNotExceedsBinary,
 		v.validateResources,
+		func(db *dbpreview.DocumentDB) field.ErrorList {
+			return otelcfg.ValidateNativeTraceExporter(db.Spec.Monitoring)
+		},
 		// Add new spec-level validations here.
 	}
 	for _, fn := range validations {

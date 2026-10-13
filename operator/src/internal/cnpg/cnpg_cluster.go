@@ -7,6 +7,7 @@ import (
 	"cmp"
 	"fmt"
 	"os"
+	"slices"
 
 	cnpgv1 "github.com/cloudnative-pg/cloudnative-pg/api/v1"
 	"github.com/go-logr/logr"
@@ -21,6 +22,8 @@ import (
 	util "github.com/documentdb/documentdb-operator/internal/utils"
 	ctrl "sigs.k8s.io/controller-runtime"
 )
+
+const managedPostgresExtensionsAnnotation = "documentdb.io/postgres-extensions-managed"
 
 // GetCnpgClusterSpec renders the Cluster for a DocumentDB instance. The
 // documentdbImage argument overrides the resolved extension image; pass "" to
@@ -63,10 +66,16 @@ func GetCnpgClusterSpecFromIntent(req ctrl.Request, documentdb *dbpreview.Docume
 		extensionImageSource.PullPolicy = pullPolicy
 	}
 
+	var annotations map[string]string
+	if pg := documentdb.Spec.Postgres; pg != nil && (len(pg.Extensions) > 0 || len(pg.SharedPreloadLibraries) > 0) {
+		annotations = map[string]string{managedPostgresExtensionsAnnotation: "true"}
+	}
+
 	return &cnpgv1.Cluster{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      req.Name,
-			Namespace: req.Namespace,
+			Name:        req.Name,
+			Namespace:   req.Namespace,
+			Annotations: annotations,
 			OwnerReferences: []metav1.OwnerReference{
 				{
 					APIVersion:         intent.Identity.APIVersion,
@@ -115,8 +124,23 @@ func GetCnpgClusterSpecFromIntent(req ctrl.Request, documentdb *dbpreview.Docume
 						addPluginParamIfSet(params, util.PLUGIN_PARAM_OTEL_MEMORY_LIMIT, split.OTel.MemoryLimit)
 						addPluginParamIfSet(params, util.PLUGIN_PARAM_OTEL_CPU_REQUEST, split.OTel.CPURequest)
 						addPluginParamIfSet(params, util.PLUGIN_PARAM_OTEL_CPU_LIMIT, split.OTel.CPULimit)
+						if native := documentdb.Spec.Monitoring.NativeTraceExporter; native != nil {
+							params["nativeTraceExporterImage"] = native.Image
+							params["nativeTraceExporterSecret"] = native.ConnectionSecretName
+							params["nativeTraceExporterCluster"] = documentdb.Name
+							params["nativeTraceExporterMemoryRequest"] = split.NativeTraceExporter.MemoryRequest
+							params["nativeTraceExporterMemoryLimit"] = split.NativeTraceExporter.MemoryLimit
+							params["nativeTraceExporterCpuRequest"] = split.NativeTraceExporter.CPURequest
+							params["nativeTraceExporterCpuLimit"] = split.NativeTraceExporter.CPULimit
+						}
 						if promPort := otelcfg.ResolvePrometheusPort(documentdb.Spec.Monitoring); promPort > 0 {
 							params["prometheusPort"] = fmt.Sprintf("%d", promPort)
+						}
+						if exporters := documentdb.Spec.Monitoring.Exporter; exporters != nil && exporters.TraceFile {
+							params["otelTraceFile"] = "true"
+							if exporters.Prometheus == nil && (exporters.OTLP == nil || exporters.OTLP.Endpoint == "") {
+								params["otelMetricsEnabled"] = "false"
+							}
 						}
 						// Compute config hash for change detection. The operator triggers a
 						// rolling restart (via restart annotation) when plugin parameters
@@ -423,19 +447,15 @@ func absentOtelMonitorRole() cnpgv1.RoleConfiguration {
 	}
 }
 
-// for the cluster.
-//
-// The operator declares the DocumentDB extension via CNPG's Extensions
-// stanza (mounted from spec.image.documentDB as an ImageVolumeSource),
-// sets a fixed AdditionalLibraries list, and applies a small set of
-// operator-managed GUCs.
+// buildPostgresConfiguration preserves the required DocumentDB image and
+// preloads while adding any explicitly configured extensions.
 func buildPostgresConfiguration(documentdb *dbpreview.DocumentDB, extensionImageSource corev1.ImageVolumeSource, pgMemoryBytes int64) cnpgv1.PostgresConfiguration {
 	pgHBA := []string{
 		"host all all localhost trust",
 		"hostssl replication streaming_replica all cert",
 	}
 
-	return cnpgv1.PostgresConfiguration{
+	config := cnpgv1.PostgresConfiguration{
 		Extensions: []cnpgv1.ExtensionConfiguration{
 			{
 				Name:                 "documentdb",
@@ -449,4 +469,15 @@ func buildPostgresConfiguration(documentdb *dbpreview.DocumentDB, extensionImage
 		Parameters:          MergeParameters(documentdb, pgMemoryBytes),
 		PgHBA:               pgHBA,
 	}
+	if pg := documentdb.Spec.Postgres; pg != nil {
+		for i := range pg.Extensions {
+			config.Extensions = append(config.Extensions, *pg.Extensions[i].DeepCopy())
+		}
+		for _, library := range pg.SharedPreloadLibraries {
+			if !slices.Contains(config.AdditionalLibraries, library) {
+				config.AdditionalLibraries = append(config.AdditionalLibraries, library)
+			}
+		}
+	}
+	return config
 }

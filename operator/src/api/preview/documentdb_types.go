@@ -215,6 +215,31 @@ type PostgresSpec struct {
 	// max_prepared_transactions) cannot be overridden.
 	// +optional
 	Parameters map[string]string `json:"parameters,omitempty"`
+
+	// Extensions adds PostgreSQL extension ImageVolumes alongside the built-in
+	// DocumentDB image. The name documentdb is reserved. Images must match the
+	// PostgreSQL major version, operating system, and architecture.
+	// A non-empty Extensions or SharedPreloadLibraries list opts into operator
+	// management of both CNPG images and preloads. Removing both restores defaults.
+	// Mounting an image does not create its SQL extension in a database.
+	// +optional
+	// +listType=map
+	// +listMapKey=name
+	// +kubebuilder:validation:MaxItems=16
+	// +kubebuilder:validation:XValidation:rule="self.all(e, e.name != 'documentdb')",message="documentdb is reserved; use spec.image.documentDB for the built-in extension image"
+	// +kubebuilder:validation:XValidation:rule="self.all(e, has(e.image) && has(e.image.reference) && size(e.image.reference) > 0)",message="each extension image must have a non-empty reference"
+	Extensions []cnpgv1.ExtensionConfiguration `json:"extensions,omitempty"`
+
+	// SharedPreloadLibraries adds modules to the required DocumentDB preloads.
+	// Use library names, not paths or a comma-separated string. CNPG continues
+	// to manage preloads for extensions such as pg_stat_statements.
+	// Changes require a PostgreSQL restart.
+	// +optional
+	// +listType=set
+	// +kubebuilder:validation:MaxItems=32
+	// +kubebuilder:validation:items:MaxLength=63
+	// +kubebuilder:validation:items:Pattern=`^[a-zA-Z_][a-zA-Z0-9_]*$`
+	SharedPreloadLibraries []string `json:"sharedPreloadLibraries,omitempty"`
 }
 
 // PluginsSpec groups CNPG plugin configuration.
@@ -289,8 +314,8 @@ type Resource struct {
 
 	// CPU specifies the total CPU envelope for each DocumentDB instance pod.
 	// The operator divides this envelope across PostgreSQL, the documentdb-gateway
-	// sidecar, and, when monitoring is enabled, the OTel collector sidecar.
-	// PostgreSQL receives the remainder after gateway and OTel CPU reservations;
+	// sidecar and enabled telemetry sidecars.
+	// PostgreSQL receives the remainder after gateway and telemetry CPU reservations;
 	// an explicit per-container CPU override wins over the automatic carve-out.
 	// If not specified or set to "0", no CPU envelope is applied.
 	// Examples: "2", "4", "500m"
@@ -298,8 +323,8 @@ type Resource struct {
 	CPU string `json:"cpu,omitempty"`
 
 	// Memory and CPU above describe the TOTAL pod envelope, but are OPTIONAL.
-	// When a sidecar (the gateway, and — with monitoring enabled — the OTel
-	// collector) shares the pod, the operator carves its memory and CPU out of
+	// When a gateway or telemetry sidecar shares the pod, the operator carves
+	// its memory and CPU out of
 	// the envelope and gives PostgreSQL the remainder, recomputing PostgreSQL's
 	// memory-aware parameters from that reduced value. The optional per-component
 	// overrides below let you size each container independently; an explicit
@@ -323,7 +348,7 @@ type Resource struct {
 
 	// Database optionally overrides the resources allocated to the PostgreSQL
 	// container. When unset, PostgreSQL receives the pod memory and CPU envelopes
-	// minus the gateway and (when monitoring is enabled) OTel collector carve-outs.
+	// minus the gateway and enabled telemetry sidecar carve-outs.
 	// +optional
 	Database *ComponentResources `json:"database,omitempty"`
 
@@ -335,11 +360,17 @@ type Resource struct {
 	// or otel.memory pins that dimension to request == limit (Guaranteed).
 	// +optional
 	OTel *ComponentResources `json:"otel,omitempty"`
+
+	// NativeTraceExporter optionally overrides the native exporter sidecar's
+	// resources. Defaults are memory request 32Mi / limit 128Mi and CPU request
+	// 25m / limit 200m. The memory limit and CPU request are reserved from the
+	// pod envelope only when monitoring.nativeTraceExporter is configured.
+	// +optional
+	NativeTraceExporter *ComponentResources `json:"nativeTraceExporter,omitempty"`
 }
 
 // ComponentResources overrides the CPU and/or memory allocated to an individual
-// container in the DocumentDB pod (PostgreSQL, the gateway, or the OTel
-// collector). Each field is a Kubernetes quantity string; when set it is applied
+// container in the DocumentDB pod. Each field is a Kubernetes quantity string; when set it is applied
 // as both the request and the limit for that container (Guaranteed-class) and
 // overrides the automatic carve-out derived from spec.resource.memory.
 type ComponentResources struct {
@@ -483,16 +514,39 @@ type IssuerRef struct {
 }
 
 // MonitoringSpec configures observability via an OTel Collector sidecar.
+// +kubebuilder:validation:XValidation:rule="!has(self.nativeTraceExporter) || (has(self.enabled) && self.enabled)",message="nativeTraceExporter requires enabled monitoring"
+// +kubebuilder:validation:XValidation:rule="!has(self.nativeTraceExporter) || (has(self.exporter) && ((has(self.exporter.traceFile) && self.exporter.traceFile) || (has(self.exporter.otlp) && size(self.exporter.otlp.endpoint) > 0)))",message="nativeTraceExporter requires a traceFile or OTLP destination"
 type MonitoringSpec struct {
-	// Enabled turns on the OTel Collector sidecar for metrics collection.
+	// Enabled turns on the OTel Collector sidecar for telemetry collection.
 	Enabled bool `json:"enabled,omitempty"`
 
-	// Exporter configures where metrics are sent.
+	// Exporter configures telemetry destinations.
 	// +optional
 	Exporter *ExporterSpec `json:"exporter,omitempty"`
+
+	// NativeTraceExporter opts into a per-pod native trace exporter. It does
+	// not enable native recording or provision database permissions. The
+	// selected source must provide the compatible restricted telemetry API.
+	// +optional
+	NativeTraceExporter *NativeTraceExporterSpec `json:"nativeTraceExporter,omitempty"`
 }
 
-// ExporterSpec configures metric export destinations.
+// NativeTraceExporterSpec runs the existing SQL-to-OTLP exporter as a sidecar.
+type NativeTraceExporterSpec struct {
+	// Image is an explicit compatible exporter image; no image is enabled by default.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=2048
+	Image string `json:"image"`
+
+	// ConnectionSecretName names a Secret in this namespace whose "uri" key
+	// contains the pod-local PostgreSQL connection URI for a restricted reader.
+	// The URI must explicitly select a loopback host, database, user, and sslmode=disable.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=253
+	ConnectionSecretName string `json:"connectionSecretName"`
+}
+
+// ExporterSpec configures telemetry export destinations.
 type ExporterSpec struct {
 	// OTLP configures the OpenTelemetry Protocol exporter.
 	// +optional
@@ -501,6 +555,15 @@ type ExporterSpec struct {
 	// Prometheus configures a Prometheus scrape endpoint on the OTel Collector sidecar.
 	// +optional
 	Prometheus *PrometheusExporterSpec `json:"prometheus,omitempty"`
+
+	// TraceFile writes OTLP traces as JSON lines in pod-local rotating files.
+	// Each file is limited to 10 MiB, with three backups in a 64 MiB emptyDir.
+	// Files are lost on pod replacement and are readable through a read-only
+	// mount in the postgres container at /var/lib/otel/traces.
+	// Enables tracing in gateway images that support OTEL_TRACES_ENABLED.
+	// Uses the Collector's experimental file exporter; disabled by default.
+	// +optional
+	TraceFile bool `json:"traceFile,omitempty"`
 }
 
 // OTLPExporterSpec configures the OTLP exporter.

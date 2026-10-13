@@ -276,6 +276,7 @@ var _ = Describe("SyncCnpgCluster", func() {
 		desired.Spec.Plugins[0].Parameters["otelConfigMapName"] = "test-cluster-otel-config"
 		desired.Spec.Plugins[0].Parameters["prometheusPort"] = "9090"
 		desired.Spec.Plugins[0].Parameters["otelConfigHash"] = "abc123"
+		desired.Spec.Plugins[0].Parameters["otelTraceFile"] = "true"
 
 		c := buildFakeClient(current).Build()
 		err := SyncCnpgCluster(context.Background(), c, current, desired, nil)
@@ -287,6 +288,7 @@ var _ = Describe("SyncCnpgCluster", func() {
 		Expect(updated.Spec.Plugins[0].Parameters["otelConfigMapName"]).To(Equal("test-cluster-otel-config"))
 		Expect(updated.Spec.Plugins[0].Parameters["prometheusPort"]).To(Equal("9090"))
 		Expect(updated.Spec.Plugins[0].Parameters["otelConfigHash"]).To(Equal("abc123"))
+		Expect(updated.Spec.Plugins[0].Parameters["otelTraceFile"]).To(Equal("true"))
 		Expect(updated.Annotations).To(HaveKey("kubectl.kubernetes.io/restartedAt"))
 	})
 
@@ -296,6 +298,8 @@ var _ = Describe("SyncCnpgCluster", func() {
 		current.Spec.Plugins[0].Parameters["otelConfigMapName"] = "test-cluster-otel-config"
 		current.Spec.Plugins[0].Parameters["prometheusPort"] = "9090"
 		current.Spec.Plugins[0].Parameters["otelConfigHash"] = "abc123"
+		current.Spec.Plugins[0].Parameters["otelTraceFile"] = "true"
+		current.Spec.Plugins[0].Parameters["otelMetricsEnabled"] = "false"
 
 		desired := baseCluster("test-cluster", namespace)
 		// desired has no OTel params → monitoring disabled
@@ -310,7 +314,39 @@ var _ = Describe("SyncCnpgCluster", func() {
 		Expect(updated.Spec.Plugins[0].Parameters).ToNot(HaveKey("otelConfigMapName"))
 		Expect(updated.Spec.Plugins[0].Parameters).ToNot(HaveKey("prometheusPort"))
 		Expect(updated.Spec.Plugins[0].Parameters).ToNot(HaveKey("otelConfigHash"))
+		Expect(updated.Spec.Plugins[0].Parameters).ToNot(HaveKey("otelTraceFile"))
+		Expect(updated.Spec.Plugins[0].Parameters).ToNot(HaveKey("otelMetricsEnabled"))
 		Expect(updated.Annotations).To(HaveKey("kubectl.kubernetes.io/restartedAt"))
+	})
+
+	It("reconciles trace-only parameters without replacing the Collector configuration reference", func() {
+		current := baseCluster("test-cluster", namespace)
+		current.Spec.Plugins[0].Parameters["otelCollectorImage"] = "otel/opentelemetry-collector-contrib:0.149.0"
+		current.Spec.Plugins[0].Parameters["otelConfigMapName"] = "test-cluster-otel-config"
+		withoutTraceFiles := current.DeepCopy()
+		desired := current.DeepCopy()
+		desired.Spec.Plugins[0].Parameters["otelTraceFile"] = "true"
+		desired.Spec.Plugins[0].Parameters["otelMetricsEnabled"] = "false"
+		c := buildFakeClient(current).Build()
+
+		Expect(SyncCnpgCluster(context.Background(), c, current, desired, nil)).To(Succeed())
+		updated := &cnpgv1.Cluster{}
+		key := types.NamespacedName{Name: current.Name, Namespace: namespace}
+		Expect(c.Get(context.Background(), key, updated)).To(Succeed())
+		Expect(updated.Spec.Plugins[0].Parameters).To(HaveKeyWithValue("otelTraceFile", "true"))
+		Expect(updated.Spec.Plugins[0].Parameters).To(HaveKeyWithValue("otelMetricsEnabled", "false"))
+		Expect(updated.Annotations).To(HaveKey("kubectl.kubernetes.io/restartedAt"))
+
+		version := updated.ResourceVersion
+		Expect(SyncCnpgCluster(context.Background(), c, updated, desired, nil)).To(Succeed())
+		Expect(c.Get(context.Background(), key, updated)).To(Succeed())
+		Expect(updated.ResourceVersion).To(Equal(version))
+
+		Expect(SyncCnpgCluster(context.Background(), c, updated, withoutTraceFiles, nil)).To(Succeed())
+		Expect(c.Get(context.Background(), key, updated)).To(Succeed())
+		Expect(updated.Spec.Plugins[0].Parameters).NotTo(HaveKey("otelTraceFile"))
+		Expect(updated.Spec.Plugins[0].Parameters).NotTo(HaveKey("otelMetricsEnabled"))
+		Expect(updated.Spec.Plugins[0].Parameters).To(HaveKeyWithValue("otelConfigMapName", "test-cluster-otel-config"))
 	})
 
 	It("detects OTel config hash changes", func() {
@@ -330,6 +366,45 @@ var _ = Describe("SyncCnpgCluster", func() {
 		Expect(c.Get(context.Background(), types.NamespacedName{Name: "test-cluster", Namespace: namespace}, updated)).To(Succeed())
 		Expect(updated.Spec.Plugins[0].Parameters["otelConfigHash"]).To(Equal("new-hash"))
 		Expect(updated.Annotations).To(HaveKey("kubectl.kubernetes.io/restartedAt"))
+	})
+
+	It("reconciles native export settings and removes them without removing monitoring", func() {
+		current := baseCluster("test-cluster", namespace)
+		current.Spec.Plugins[0].Parameters["otelCollectorImage"] = "otel:test"
+		current.Spec.Plugins[0].Parameters["otelConfigMapName"] = "otel-config"
+		withoutNative := current.DeepCopy()
+		desired := current.DeepCopy()
+		native := map[string]string{
+			"nativeTraceExporterImage":         "native:test",
+			"nativeTraceExporterSecret":        "native-reader",
+			"nativeTraceExporterCluster":       "logical-cluster",
+			"nativeTraceExporterMemoryRequest": "32Mi",
+			"nativeTraceExporterMemoryLimit":   "128Mi",
+			"nativeTraceExporterCpuRequest":    "25m",
+			"nativeTraceExporterCpuLimit":      "200m",
+		}
+		for key, value := range native {
+			desired.Spec.Plugins[0].Parameters[key] = value
+		}
+		c := buildFakeClient(current).Build()
+		Expect(SyncCnpgCluster(context.Background(), c, current, desired, nil)).To(Succeed())
+		updated := &cnpgv1.Cluster{}
+		key := types.NamespacedName{Name: current.Name, Namespace: namespace}
+		Expect(c.Get(context.Background(), key, updated)).To(Succeed())
+		for name, value := range native {
+			Expect(updated.Spec.Plugins[0].Parameters).To(HaveKeyWithValue(name, value))
+		}
+		Expect(updated.Annotations).To(HaveKey("kubectl.kubernetes.io/restartedAt"))
+		version := updated.ResourceVersion
+		Expect(SyncCnpgCluster(context.Background(), c, updated, desired, nil)).To(Succeed())
+		Expect(c.Get(context.Background(), key, updated)).To(Succeed())
+		Expect(updated.ResourceVersion).To(Equal(version))
+		Expect(SyncCnpgCluster(context.Background(), c, updated, withoutNative, nil)).To(Succeed())
+		Expect(c.Get(context.Background(), key, updated)).To(Succeed())
+		for name := range native {
+			Expect(updated.Spec.Plugins[0].Parameters).NotTo(HaveKey(name))
+		}
+		Expect(updated.Spec.Plugins[0].Parameters).To(HaveKeyWithValue("otelConfigMapName", "otel-config"))
 	})
 
 	It("syncs sidecar resource parameters including the OTel CPU limit", func() {
@@ -633,6 +708,120 @@ var _ = Describe("SyncCnpgCluster - mutable spec fields", func() {
 		updated := &cnpgv1.Cluster{}
 		Expect(c.Get(context.Background(), types.NamespacedName{Name: "test-cluster", Namespace: namespace}, updated)).To(Succeed())
 		Expect(updated.Spec.Certificates.ServerTLSSecret).To(Equal("new-tls"))
+	})
+})
+
+var _ = Describe("SyncCnpgCluster - additional extensions", func() {
+	const namespace = "test-ns"
+
+	pgsentinel := cnpgv1.ExtensionConfiguration{
+		Name: "pgsentinel",
+		ImageVolumeSource: corev1.ImageVolumeSource{
+			Reference: "pgsentinel:1.5.1", PullPolicy: corev1.PullIfNotPresent,
+		},
+	}
+
+	It("adds and updates additional images and preloads, then converges", func() {
+		current := baseCluster("test-cluster", namespace)
+		desired := current.DeepCopy()
+		desired.Annotations = map[string]string{managedPostgresExtensionsAnnotation: "true"}
+		desired.Spec.PostgresConfiguration.Extensions = append(desired.Spec.PostgresConfiguration.Extensions, pgsentinel)
+		desired.Spec.PostgresConfiguration.AdditionalLibraries = []string{"pg_cron", "pg_documentdb_core", "pg_documentdb", "pgsentinel"}
+
+		c := buildFakeClient(current).Build()
+		key := types.NamespacedName{Name: current.Name, Namespace: namespace}
+		for _, image := range []string{"pgsentinel:1.5.1", "pgsentinel:next"} {
+			desired.Spec.PostgresConfiguration.Extensions[1].ImageVolumeSource.Reference = image
+			Expect(SyncCnpgCluster(context.Background(), c, current, desired, nil)).To(Succeed())
+			Expect(c.Get(context.Background(), key, current)).To(Succeed())
+			Expect(current.Spec.PostgresConfiguration.Extensions).To(Equal(desired.Spec.PostgresConfiguration.Extensions))
+			Expect(current.Spec.PostgresConfiguration.AdditionalLibraries).To(Equal(desired.Spec.PostgresConfiguration.AdditionalLibraries))
+			Expect(current.Annotations).To(HaveKeyWithValue(managedPostgresExtensionsAnnotation, "true"))
+			Expect(current.Annotations).NotTo(HaveKey("kubectl.kubernetes.io/restartedAt"))
+
+			version := current.ResourceVersion
+			Expect(SyncCnpgCluster(context.Background(), c, current, desired, nil)).To(Succeed())
+			Expect(c.Get(context.Background(), key, current)).To(Succeed())
+			Expect(current.ResourceVersion).To(Equal(version))
+		}
+	})
+
+	It("removes formerly managed images and preloads when the opt-in is removed", func() {
+		desired := baseCluster("test-cluster", namespace)
+		desired.Spec.PostgresConfiguration.AdditionalLibraries = []string{"pg_cron", "pg_documentdb_core", "pg_documentdb"}
+		current := desired.DeepCopy()
+		current.Annotations = map[string]string{managedPostgresExtensionsAnnotation: "true", "example.com/keep": "yes"}
+		current.Spec.PostgresConfiguration.Extensions = append(current.Spec.PostgresConfiguration.Extensions, pgsentinel)
+		current.Spec.PostgresConfiguration.AdditionalLibraries = append(current.Spec.PostgresConfiguration.AdditionalLibraries, "pgsentinel")
+
+		c := buildFakeClient(current).Build()
+		Expect(SyncCnpgCluster(context.Background(), c, current, desired, nil)).To(Succeed())
+		Expect(c.Get(context.Background(), types.NamespacedName{Name: current.Name, Namespace: namespace}, current)).To(Succeed())
+		Expect(current.Spec.PostgresConfiguration).To(Equal(desired.Spec.PostgresConfiguration))
+		Expect(current.Annotations).NotTo(HaveKey(managedPostgresExtensionsAnnotation))
+		Expect(current.Annotations).To(HaveKeyWithValue("example.com/keep", "yes"))
+	})
+
+	It("preserves unmanaged CNPG additions when changing the built-in image", func() {
+		desired := baseCluster("test-cluster", namespace)
+		current := desired.DeepCopy()
+		current.Spec.PostgresConfiguration.Extensions = append(current.Spec.PostgresConfiguration.Extensions, pgsentinel)
+		current.Spec.PostgresConfiguration.AdditionalLibraries = []string{"pgsentinel"}
+		desired.Spec.PostgresConfiguration.Extensions[0].ImageVolumeSource.Reference = "documentdb:next"
+
+		c := buildFakeClient(current).Build()
+		Expect(SyncCnpgCluster(context.Background(), c, current, desired, nil)).To(Succeed())
+		Expect(c.Get(context.Background(), types.NamespacedName{Name: current.Name, Namespace: namespace}, current)).To(Succeed())
+		Expect(current.Spec.PostgresConfiguration.Extensions[0].ImageVolumeSource.Reference).To(Equal("documentdb:next"))
+		Expect(current.Spec.PostgresConfiguration.Extensions[1]).To(Equal(pgsentinel))
+		Expect(current.Spec.PostgresConfiguration.AdditionalLibraries).To(Equal([]string{"pgsentinel"}))
+	})
+
+	It("keeps ownership and restart annotations in the same preload-only patch", func() {
+		current := baseCluster("test-cluster", namespace)
+		desired := current.DeepCopy()
+		desired.Annotations = map[string]string{managedPostgresExtensionsAnnotation: "true"}
+		desired.Spec.PostgresConfiguration.AdditionalLibraries = []string{"pg_cron", "pg_documentdb_core", "pg_documentdb"}
+		desired.Spec.Plugins[0].Parameters["gatewayImage"] = "gateway:next"
+
+		c := buildFakeClient(current).Build()
+		Expect(SyncCnpgCluster(context.Background(), c, current, desired, nil)).To(Succeed())
+		Expect(c.Get(context.Background(), types.NamespacedName{Name: current.Name, Namespace: namespace}, current)).To(Succeed())
+		Expect(current.Annotations).To(HaveKeyWithValue(managedPostgresExtensionsAnnotation, "true"))
+		Expect(current.Annotations).To(HaveKey("kubectl.kubernetes.io/restartedAt"))
+	})
+
+	It("restarts for extension environment changes without an image update", func() {
+		current := baseCluster("test-cluster", namespace)
+		current.Annotations = map[string]string{managedPostgresExtensionsAnnotation: "true"}
+		current.Spec.PostgresConfiguration.Extensions = append(current.Spec.PostgresConfiguration.Extensions, pgsentinel)
+		desired := current.DeepCopy()
+		desired.Spec.PostgresConfiguration.Extensions[1].Env = []cnpgv1.ExtensionEnvVar{{Name: "EXAMPLE", Value: "updated"}}
+
+		c := buildFakeClient(current).Build()
+		Expect(SyncCnpgCluster(context.Background(), c, current, desired, nil)).To(Succeed())
+		Expect(c.Get(context.Background(), types.NamespacedName{Name: current.Name, Namespace: namespace}, current)).To(Succeed())
+		Expect(current.Annotations).To(HaveKey("kubectl.kubernetes.io/restartedAt"))
+		Expect(current.Spec.PostgresConfiguration.Extensions[1].Env).To(Equal(desired.Spec.PostgresConfiguration.Extensions[1].Env))
+	})
+
+	It("does not restart when empty optional lists are omitted during serialization", func() {
+		current := baseCluster("test-cluster", namespace)
+		current.Annotations = map[string]string{managedPostgresExtensionsAnnotation: "true"}
+		current.Spec.Managed = &cnpgv1.ManagedConfiguration{Roles: []cnpgv1.RoleConfiguration{absentOtelMonitorRole()}}
+		current.Spec.PostgresConfiguration.Extensions = append(current.Spec.PostgresConfiguration.Extensions, pgsentinel)
+		desired := current.DeepCopy()
+		desired.Spec.PostgresConfiguration.Extensions[1].DynamicLibraryPath = []string{}
+		desired.Spec.PostgresConfiguration.Extensions[1].Env = []cnpgv1.ExtensionEnvVar{}
+
+		c := buildFakeClient(current).Build()
+		key := types.NamespacedName{Name: current.Name, Namespace: namespace}
+		Expect(c.Get(context.Background(), key, current)).To(Succeed())
+		version := current.ResourceVersion
+		Expect(SyncCnpgCluster(context.Background(), c, current, desired, nil)).To(Succeed())
+		Expect(c.Get(context.Background(), key, current)).To(Succeed())
+		Expect(current.ResourceVersion).To(Equal(version))
+		Expect(current.Annotations).NotTo(HaveKey("kubectl.kubernetes.io/restartedAt"))
 	})
 })
 

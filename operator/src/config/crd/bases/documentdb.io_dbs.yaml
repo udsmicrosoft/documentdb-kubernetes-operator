@@ -1272,11 +1272,11 @@ spec:
                   sidecar.
                 properties:
                   enabled:
-                    description: Enabled turns on the OTel Collector sidecar for metrics
+                    description: Enabled turns on the OTel Collector sidecar for telemetry
                       collection.
                     type: boolean
                   exporter:
-                    description: Exporter configures where metrics are sent.
+                    description: Exporter configures telemetry destinations.
                     properties:
                       otlp:
                         description: OTLP configures the OpenTelemetry Protocol exporter.
@@ -1301,8 +1301,49 @@ spec:
                             minimum: 1024
                             type: integer
                         type: object
+                      traceFile:
+                        description: |-
+                          TraceFile writes OTLP traces as JSON lines in pod-local rotating files.
+                          Each file is limited to 10 MiB, with three backups in a 64 MiB emptyDir.
+                          Files are lost on pod replacement and are readable through a read-only
+                          mount in the postgres container at /var/lib/otel/traces.
+                          Enables tracing in gateway images that support OTEL_TRACES_ENABLED.
+                          Uses the Collector's experimental file exporter; disabled by default.
+                        type: boolean
+                    type: object
+                  nativeTraceExporter:
+                    description: |-
+                      NativeTraceExporter opts into a per-pod native trace exporter. It does
+                      not enable native recording or provision database permissions. The
+                      selected source must provide the compatible restricted telemetry API.
+                    properties:
+                      connectionSecretName:
+                        description: |-
+                          ConnectionSecretName names a Secret in this namespace whose "uri" key
+                          contains the pod-local PostgreSQL connection URI for a restricted reader.
+                          The URI must explicitly select a loopback host, database, user, and sslmode=disable.
+                        maxLength: 253
+                        minLength: 1
+                        type: string
+                      image:
+                        description: Image is an explicit compatible exporter image;
+                          no image is enabled by default.
+                        maxLength: 2048
+                        minLength: 1
+                        type: string
+                    required:
+                    - connectionSecretName
+                    - image
                     type: object
                 type: object
+                x-kubernetes-validations:
+                - message: nativeTraceExporter requires enabled monitoring
+                  rule: '!has(self.nativeTraceExporter) || (has(self.enabled) && self.enabled)'
+                - message: nativeTraceExporter requires a traceFile or OTLP destination
+                  rule: '!has(self.nativeTraceExporter) || (has(self.exporter) &&
+                    ((has(self.exporter.traceFile) && self.exporter.traceFile) ||
+                    (has(self.exporter.otlp) && size(self.exporter.otlp.endpoint)
+                    > 0)))'
               nodeCount:
                 description: NodeCount is the number of nodes in the DocumentDB cluster.
                   Must be 1.
@@ -1334,6 +1375,130 @@ spec:
                   Postgres groups PostgreSQL process-level tuning (UID/GID, custom post-init SQL).
                   All fields are optional; defaults are preserved when omitted.
                 properties:
+                  extensions:
+                    description: |-
+                      Extensions adds PostgreSQL extension ImageVolumes alongside the built-in
+                      DocumentDB image. The name documentdb is reserved. Images must match the
+                      PostgreSQL major version, operating system, and architecture.
+                      A non-empty Extensions or SharedPreloadLibraries list opts into operator
+                      management of both CNPG images and preloads. Removing both restores defaults.
+                      Mounting an image does not create its SQL extension in a database.
+                    items:
+                      description: |-
+                        ExtensionConfiguration is the configuration used to add
+                        PostgreSQL extensions to the Cluster.
+                      properties:
+                        bin_path:
+                          description: |-
+                            A list of directories within the image to be appended to the
+                            PostgreSQL process's `PATH` environment variable.
+                          items:
+                            type: string
+                          type: array
+                        dynamic_library_path:
+                          description: |-
+                            The list of directories inside the image which should be added to dynamic_library_path.
+                            If not defined, defaults to "/lib".
+                          items:
+                            type: string
+                          type: array
+                        env:
+                          description: |-
+                            Env is a list of custom environment variables to be set in the
+                            PostgreSQL process for this extension. It is the responsibility of the
+                            cluster administrator to ensure the variables are correct for the
+                            specific extension. Note that changes to these variables require
+                            a manual cluster restart to take effect.
+                          items:
+                            description: |-
+                              ExtensionEnvVar defines an environment variable for a specific extension
+                              image volume.
+                            properties:
+                              name:
+                                description: |-
+                                  Name of the environment variable to be injected into the
+                                  PostgreSQL process.
+                                minLength: 1
+                                pattern: ^[a-zA-Z_][a-zA-Z0-9_]*$
+                                type: string
+                              value:
+                                description: |-
+                                  Value of the environment variable. CloudNativePG performs a direct
+                                  replacement of this value, with support for placeholder expansion.
+                                  The ${`image_root`} placeholder resolves to the absolute mount path
+                                  of the extension's volume (e.g., `/extensions/my-extension`). This
+                                  is particularly useful for allowing applications or libraries to
+                                  locate specific directories within the mounted image.
+                                  Unrecognized placeholders are rejected. To include a literal ${...}
+                                  in the value, escape it as $${...}.
+                                minLength: 1
+                                type: string
+                            required:
+                            - name
+                            - value
+                            type: object
+                          type: array
+                          x-kubernetes-list-map-keys:
+                          - name
+                          x-kubernetes-list-type: map
+                        extension_control_path:
+                          description: |-
+                            The list of directories inside the image which should be added to extension_control_path.
+                            If not defined, defaults to "/share".
+                          items:
+                            type: string
+                          type: array
+                        image:
+                          description: The image containing the extension.
+                          properties:
+                            pullPolicy:
+                              description: |-
+                                Policy for pulling OCI objects. Possible values are:
+                                Always: the kubelet always attempts to pull the reference. Container creation will fail If the pull fails.
+                                Never: the kubelet never pulls the reference and only uses a local image or artifact. Container creation will fail if the reference isn't present.
+                                IfNotPresent: the kubelet pulls if the reference isn't already present on disk. Container creation will fail if the reference isn't present and the pull fails.
+                                Defaults to Always if :latest tag is specified, or IfNotPresent otherwise.
+                              type: string
+                            reference:
+                              description: |-
+                                Required: Image or artifact reference to be used.
+                                Behaves in the same way as pod.spec.containers[*].image.
+                                Pull secrets will be assembled in the same way as for the container image by looking up node credentials, SA image pull secrets, and pod spec image pull secrets.
+                                More info: https://kubernetes.io/docs/concepts/containers/images
+                                This field is optional to allow higher level config management to default or override
+                                container images in workload controllers like Deployments and StatefulSets.
+                              type: string
+                          type: object
+                        ld_library_path:
+                          description: The list of directories inside the image which
+                            should be added to ld_library_path.
+                          items:
+                            type: string
+                          type: array
+                        name:
+                          description: |-
+                            The name of the extension, required. The limit of 59 characters
+                            leaves room for the prefix the operator adds when deriving the
+                            extension's Kubernetes Volume name (capped at 63 characters).
+                          maxLength: 59
+                          minLength: 1
+                          pattern: ^[a-z0-9]([-a-z0-9_]*[a-z0-9])?$
+                          type: string
+                      required:
+                      - name
+                      type: object
+                    maxItems: 16
+                    type: array
+                    x-kubernetes-list-map-keys:
+                    - name
+                    x-kubernetes-list-type: map
+                    x-kubernetes-validations:
+                    - message: documentdb is reserved; use spec.image.documentDB for
+                        the built-in extension image
+                      rule: self.all(e, e.name != 'documentdb')
+                    - message: each extension image must have a non-empty reference
+                      rule: self.all(e, has(e.image) && has(e.image.reference) &&
+                        size(e.image.reference) > 0)
                   gid:
                     description: |-
                       GID is the numeric group ID under which the PostgreSQL server process runs.
@@ -1363,6 +1528,19 @@ spec:
                     items:
                       type: string
                     type: array
+                  sharedPreloadLibraries:
+                    description: |-
+                      SharedPreloadLibraries adds modules to the required DocumentDB preloads.
+                      Use library names, not paths or a comma-separated string. CNPG continues
+                      to manage preloads for extensions such as pg_stat_statements.
+                      Changes require a PostgreSQL restart.
+                    items:
+                      maxLength: 63
+                      pattern: ^[a-zA-Z_][a-zA-Z0-9_]*$
+                      type: string
+                    maxItems: 32
+                    type: array
+                    x-kubernetes-list-type: set
                   uid:
                     description: |-
                       UID is the numeric user ID under which the PostgreSQL server process runs.
@@ -1380,8 +1558,8 @@ spec:
                     description: |-
                       CPU specifies the total CPU envelope for each DocumentDB instance pod.
                       The operator divides this envelope across PostgreSQL, the documentdb-gateway
-                      sidecar, and, when monitoring is enabled, the OTel collector sidecar.
-                      PostgreSQL receives the remainder after gateway and OTel CPU reservations;
+                      sidecar and enabled telemetry sidecars.
+                      PostgreSQL receives the remainder after gateway and telemetry CPU reservations;
                       an explicit per-container CPU override wins over the automatic carve-out.
                       If not specified or set to "0", no CPU envelope is applied.
                       Examples: "2", "4", "500m"
@@ -1390,7 +1568,7 @@ spec:
                     description: |-
                       Database optionally overrides the resources allocated to the PostgreSQL
                       container. When unset, PostgreSQL receives the pod memory and CPU envelopes
-                      minus the gateway and (when monitoring is enabled) OTel collector carve-outs.
+                      minus the gateway and enabled telemetry sidecar carve-outs.
                     properties:
                       cpu:
                         description: CPU is the CPU request=limit for the container
@@ -1434,6 +1612,24 @@ spec:
                       defaults are used for memory-aware parameters.
                       Examples: "2Gi", "4Gi", "8Gi"
                     type: string
+                  nativeTraceExporter:
+                    description: |-
+                      NativeTraceExporter optionally overrides the native exporter sidecar's
+                      resources. Defaults are memory request 32Mi / limit 128Mi and CPU request
+                      25m / limit 200m. The memory limit and CPU request are reserved from the
+                      pod envelope only when monitoring.nativeTraceExporter is configured.
+                    properties:
+                      cpu:
+                        description: CPU is the CPU request=limit for the container
+                          (e.g. "500m", "2").
+                        pattern: ^([0-9]+(\.[0-9]+)?(m|Ki|Mi|Gi|Ti|Pi|Ei|k|M|G|T|P|E)?)?$
+                        type: string
+                      memory:
+                        description: Memory is the memory request=limit for the container
+                          (e.g. "512Mi", "2Gi").
+                        pattern: ^([0-9]+(\.[0-9]+)?(m|Ki|Mi|Gi|Ti|Pi|Ei|k|M|G|T|P|E)?)?$
+                        type: string
+                    type: object
                   otel:
                     description: |-
                       OTel optionally overrides the resources allocated to the otel-collector

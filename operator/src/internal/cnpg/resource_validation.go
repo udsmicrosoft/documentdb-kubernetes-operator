@@ -17,7 +17,7 @@ import (
 // validating webhook.
 //
 // For each dimension (memory, cpu) the rule is:
-//   - If the pod envelope (spec.resource.<dim>) is set, the gateway + OTel
+//   - If the pod envelope (spec.resource.<dim>) is set, gateway and telemetry
 //     reservations must leave room for PostgreSQL, and any explicit per-container
 //     values must not sum beyond the envelope.
 //   - If the envelope is omitted but at least one container sets the dimension,
@@ -31,6 +31,8 @@ func ValidateResources(documentdb *dbpreview.DocumentDB, cfg SplitConfig) field.
 	res := documentdb.Spec.Resource
 	monitoring := documentdb.Spec.Monitoring != nil && documentdb.Spec.Monitoring.Enabled
 	base := field.NewPath("spec", "resource")
+	native := nativeTraceExporterResources(documentdb)
+	nativeEnabled := native.MemoryLimit != ""
 
 	// Memory reservations, with defaults applied when a container omits the
 	// value (gateway always defaults to its fraction of the envelope).
@@ -61,32 +63,36 @@ func ValidateResources(documentdb *dbpreview.DocumentDB, cfg SplitConfig) field.
 	}
 
 	errs := validateDimension(base, dimension{
-		noun:         "memory",
-		envSet:       isSet(res.Memory),
-		gwSet:        componentMemSet(res.Gateway),
-		dbSet:        componentMemSet(res.Database),
-		otelSet:      monitoring && componentMemSet(res.OTel),
-		envValue:     res.Memory,
-		dbValue:      componentMemoryValue(res.Database),
-		envQty:       memEnv,
-		gwReserved:   memGw,
-		otelReserved: memOTel,
-		dbQty:        componentMemBytes(res.Database),
-		format:       bytesToQuantity,
+		noun:           "memory",
+		envSet:         isSet(res.Memory),
+		gwSet:          componentMemSet(res.Gateway),
+		dbSet:          componentMemSet(res.Database),
+		otelSet:        monitoring && componentMemSet(res.OTel),
+		nativeSet:      nativeEnabled && componentMemSet(res.NativeTraceExporter),
+		envValue:       res.Memory,
+		dbValue:        componentMemoryValue(res.Database),
+		envQty:         memEnv,
+		gwReserved:     memGw,
+		otelReserved:   memOTel,
+		nativeReserved: parseMemoryToBytes(native.MemoryLimit),
+		dbQty:          componentMemBytes(res.Database),
+		format:         bytesToQuantity,
 	})
 	errs = append(errs, validateDimension(base, dimension{
-		noun:         "cpu",
-		envSet:       isSet(res.CPU),
-		gwSet:        componentCPUSet(res.Gateway),
-		dbSet:        componentCPUSet(res.Database),
-		otelSet:      monitoring && componentCPUSet(res.OTel),
-		envValue:     res.CPU,
-		dbValue:      componentCPUValue(res.Database),
-		envQty:       cpuEnv,
-		gwReserved:   cpuGw,
-		otelReserved: cpuOTel,
-		dbQty:        componentCPUMilli(res.Database),
-		format:       milliCPUString,
+		noun:           "cpu",
+		envSet:         isSet(res.CPU),
+		gwSet:          componentCPUSet(res.Gateway),
+		dbSet:          componentCPUSet(res.Database),
+		otelSet:        monitoring && componentCPUSet(res.OTel),
+		nativeSet:      nativeEnabled && componentCPUSet(res.NativeTraceExporter),
+		envValue:       res.CPU,
+		dbValue:        componentCPUValue(res.Database),
+		envQty:         cpuEnv,
+		gwReserved:     cpuGw,
+		otelReserved:   cpuOTel,
+		nativeReserved: cpuMilli(native.CPURequest),
+		dbQty:          componentCPUMilli(res.Database),
+		format:         milliCPUString,
 	})...)
 	return errs
 }
@@ -95,12 +101,13 @@ func ValidateResources(documentdb *dbpreview.DocumentDB, cfg SplitConfig) field.
 // used by validateDimension. Quantities are in the dimension's native unit
 // (bytes for memory, milli-CPU for cpu); format renders that unit for messages.
 type dimension struct {
-	noun                             string // "memory" or "cpu", used in paths and messages
-	envSet, gwSet, dbSet, otelSet    bool
-	envValue, dbValue                string // raw quantity strings for error display
-	envQty, gwReserved, otelReserved int64
-	dbQty                            int64
-	format                           func(int64) string
+	noun                                     string // "memory" or "cpu", used in paths and messages
+	envSet, gwSet, dbSet, otelSet, nativeSet bool
+	envValue, dbValue                        string // raw quantity strings for error display
+	envQty, gwReserved, otelReserved         int64
+	nativeReserved                           int64
+	dbQty                                    int64
+	format                                   func(int64) string
 }
 
 // validateDimension enforces the envelope-optional rules for a single dimension.
@@ -110,23 +117,29 @@ func validateDimension(base *field.Path, d dimension) field.ErrorList {
 	if !d.envSet {
 		// Envelope omitted: it can only be derived when both the gateway and the
 		// database pin the dimension; any other partial configuration is invalid.
-		if (d.gwSet || d.dbSet || d.otelSet) && !(d.gwSet && d.dbSet) {
+		if (d.gwSet || d.dbSet || d.otelSet || d.nativeSet) && (!d.gwSet || !d.dbSet) {
 			errs = append(errs, field.Required(base.Child(d.noun),
 				fmt.Sprintf("pod %s envelope is required unless %s is set on both spec.resource.gateway and spec.resource.database", d.noun, d.noun)))
 		}
 		return errs
 	}
-	reserved := d.gwReserved + d.otelReserved
+	reserved := d.gwReserved + d.otelReserved + d.nativeReserved
+	reservations := "gateway and OTel"
+	components := "gateway + OTel + database"
+	if d.nativeReserved > 0 {
+		reservations = "gateway, OTel and native trace exporter"
+		components = "gateway + OTel + native trace exporter + database"
+	}
 	switch {
 	case reserved >= d.envQty:
 		errs = append(errs, field.Invalid(base.Child(d.noun), d.envValue,
-			fmt.Sprintf("gateway and OTel %s reservations (%s) leave no %s for PostgreSQL within the pod %s envelope (%s)",
-				d.noun, d.format(reserved), d.noun, d.noun, d.envValue)))
+			fmt.Sprintf("%s %s reservations (%s) leave no %s for PostgreSQL within the pod %s envelope (%s)",
+				reservations, d.noun, d.format(reserved), d.noun, d.noun, d.envValue)))
 	case d.dbSet:
 		if total := reserved + d.dbQty; total > d.envQty {
 			errs = append(errs, field.Invalid(base.Child("database", d.noun), d.dbValue,
-				fmt.Sprintf("sum of gateway + OTel + database %s (%s) exceeds the pod %s envelope (%s)",
-					d.noun, d.format(total), d.noun, d.envValue)))
+				fmt.Sprintf("sum of %s %s (%s) exceeds the pod %s envelope (%s)",
+					components, d.noun, d.format(total), d.noun, d.envValue)))
 		}
 	}
 	return errs

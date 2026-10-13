@@ -61,8 +61,9 @@ type ResourceSplit struct {
 	Postgres ComponentResource
 	Gateway  ComponentResource
 	// OTel is only populated when monitoring is enabled.
-	OTel              ComponentResource
-	MonitoringEnabled bool
+	OTel                ComponentResource
+	NativeTraceExporter ComponentResource
+	MonitoringEnabled   bool
 	// PostgresMemoryBytes is the memory limit (bytes) PostgreSQL receives after
 	// the carve-out. Used to compute memory-aware GUCs. 0 means unset/unlimited.
 	PostgresMemoryBytes int64
@@ -84,13 +85,32 @@ func DefaultSplitConfig() SplitConfig {
 	}
 }
 
+func nativeTraceExporterResources(documentdb *dbpreview.DocumentDB) ComponentResource {
+	if documentdb.Spec.Monitoring == nil || !documentdb.Spec.Monitoring.Enabled ||
+		documentdb.Spec.Monitoring.NativeTraceExporter == nil {
+		return ComponentResource{}
+	}
+	resolved := ComponentResource{
+		MemoryRequest: "32Mi", MemoryLimit: "128Mi",
+		CPURequest: "25m", CPULimit: "200m",
+	}
+	override := documentdb.Spec.Resource.NativeTraceExporter
+	if componentMemSet(override) {
+		resolved.setMemory(override.Memory)
+	}
+	if cpu := componentCPU(override); cpu != "" {
+		resolved.setCPU(cpu)
+	}
+	return resolved
+}
+
 // ComputeResourceSplit resolves how the pod memory and CPU envelopes
 // (spec.resource.memory / spec.resource.cpu) are divided across the PostgreSQL,
-// gateway, and (when monitoring is enabled) OTel collector containers.
+// gateway, and enabled telemetry containers.
 //
 // The envelope is OPTIONAL. For each dimension:
-//   - If the envelope is set, the operator carves it: the gateway and OTel
-//     collector reservations are subtracted and PostgreSQL (the sink) gets the
+//   - If the envelope is set, gateway and telemetry reservations are
+//     subtracted and PostgreSQL (the sink) gets the
 //     remainder. Unset reservations fall back to defaults (gateway memory =
 //     min(fraction × envelope, cap); OTel memory = limit default; OTel cpu =
 //     request default).
@@ -108,6 +128,7 @@ func ComputeResourceSplit(documentdb *dbpreview.DocumentDB, cfg SplitConfig) Res
 
 	envelopeBytes := parseMemoryToBytes(res.Memory)
 	split := ResourceSplit{MonitoringEnabled: monitoring}
+	split.NativeTraceExporter = nativeTraceExporterResources(documentdb)
 
 	// --- OTel collector (memory) ---
 	var otelBytes int64
@@ -158,7 +179,7 @@ func ComputeResourceSplit(documentdb *dbpreview.DocumentDB, cfg SplitConfig) Res
 		split.Postgres.setMemory(res.Database.Memory)
 		split.PostgresMemoryBytes = parseMemoryToBytes(res.Database.Memory)
 	} else if envelopeBytes > 0 {
-		dbBytes := envelopeBytes - gatewayBytes - otelBytes
+		dbBytes := envelopeBytes - gatewayBytes - otelBytes - parseMemoryToBytes(split.NativeTraceExporter.MemoryLimit)
 		if dbBytes < 0 {
 			dbBytes = 0
 		}
@@ -169,12 +190,12 @@ func ComputeResourceSplit(documentdb *dbpreview.DocumentDB, cfg SplitConfig) Res
 	}
 
 	// PostgreSQL CPU (sink): database override wins; otherwise the pod CPU
-	// envelope minus the gateway and OTel CPU reservations, symmetric with the
+	// envelope minus gateway and telemetry CPU reservations, symmetric with the
 	// memory carve-out so the resolved container CPUs sum to the envelope.
 	if cpu := componentCPU(res.Database); cpu != "" {
 		split.Postgres.setCPU(cpu)
 	} else if env := normalizeCPU(res.CPU); env != "" {
-		pgCPU := subtractCPU(env, split.Gateway.CPURequest, split.OTel.CPURequest)
+		pgCPU := subtractCPU(env, split.Gateway.CPURequest, split.OTel.CPURequest, split.NativeTraceExporter.CPURequest)
 		if pgCPU != "" {
 			split.Postgres.setCPU(pgCPU)
 		}

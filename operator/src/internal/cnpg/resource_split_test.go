@@ -189,6 +189,44 @@ func TestComputeResourceSplit_CPUCarvedWithMonitoring(t *testing.T) {
 	}
 }
 
+func TestNativeTraceExporterResourcesAreReservedOnlyWhenEnabled(t *testing.T) {
+	db := ddbWithMemory("2Gi", true)
+	db.Spec.Resource.CPU = "2"
+	cfg := prodSplitConfig()
+	before := ComputeResourceSplit(db, cfg)
+	db.Spec.Monitoring.NativeTraceExporter = &dbpreview.NativeTraceExporterSpec{
+		Image: "native:test", ConnectionSecretName: "native-reader",
+	}
+	withExporter := ComputeResourceSplit(db, cfg)
+	if withExporter.PostgresMemoryBytes != before.PostgresMemoryBytes-128*1024*1024 ||
+		cpuMilli(withExporter.Postgres.CPURequest) != cpuMilli(before.Postgres.CPURequest)-25 {
+		t.Fatalf("native exporter was not reserved from the database envelope: %+v", withExporter)
+	}
+	db.Spec.Resource.NativeTraceExporter = &dbpreview.ComponentResources{Memory: "256Mi", CPU: "100m"}
+	override := ComputeResourceSplit(db, cfg)
+	if override.PostgresMemoryBytes != before.PostgresMemoryBytes-256*1024*1024 ||
+		cpuMilli(override.Postgres.CPURequest) != cpuMilli(before.Postgres.CPURequest)-100 {
+		t.Fatalf("native exporter override was not reserved: %+v", override)
+	}
+	db.Spec.Monitoring.NativeTraceExporter = nil
+	disabled := ComputeResourceSplit(db, cfg)
+	if disabled.PostgresMemoryBytes != before.PostgresMemoryBytes ||
+		disabled.NativeTraceExporter.MemoryLimit != "" {
+		t.Fatal("disabled native export must not reserve resources")
+	}
+	db.Spec.Resource.Memory = "300Mi"
+	db.Spec.Resource.NativeTraceExporter = nil
+	if errs := ValidateResources(db, cfg); len(errs) != 0 {
+		t.Fatalf("baseline should fit: %v", errs)
+	}
+	db.Spec.Monitoring.NativeTraceExporter = &dbpreview.NativeTraceExporterSpec{
+		Image: "native:test", ConnectionSecretName: "native-reader",
+	}
+	if errs := ValidateResources(db, cfg); len(errs) == 0 {
+		t.Fatal("adding a native exporter must reject an exhausted envelope")
+	}
+}
+
 func TestValidateResources(t *testing.T) {
 	cfg := prodSplitConfig()
 	mk := func(memEnv, cpuEnv string, monitoring bool) *dbpreview.DocumentDB {

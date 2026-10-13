@@ -117,6 +117,27 @@ _Appears in:_
 | `primary` _string_ | Primary is the name of the primary cluster for replication. |  |  |
 | `clusterList` _[MemberCluster](#membercluster) array_ | ClusterList is the list of clusters participating in replication. |  |  |
 | `highAvailability` _boolean_ | Whether or not to have replicas on the primary cluster. |  |  |
+| `disableTLS` _boolean_ | Disables TLS for replication traffic between clusters.<br />Only for use when an existing mesh is already providing TLS. | false |  |
+
+
+#### ComponentResources
+
+
+
+ComponentResources overrides the CPU and/or memory allocated to an individual
+container in the DocumentDB pod. Each field is a Kubernetes quantity string; when set it is applied
+as both the request and the limit for that container (Guaranteed-class) and
+overrides the automatic carve-out derived from spec.resource.memory.
+
+
+
+_Appears in:_
+- [Resource](#resource)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `memory` _string_ | Memory is the memory request=limit for the container (e.g. "512Mi", "2Gi"). |  | Pattern: `^([0-9]+(\.[0-9]+)?(m\|Ki\|Mi\|Gi\|Ti\|Pi\|Ei\|k\|M\|G\|T\|P\|E)?)?$` <br />Optional: \{\} <br /> |
+| `cpu` _string_ | CPU is the CPU request=limit for the container (e.g. "500m", "2"). |  | Pattern: `^([0-9]+(\.[0-9]+)?(m\|Ki\|Mi\|Gi\|Ti\|Pi\|Ei\|k\|M\|G\|T\|P\|E)?)?$` <br />Optional: \{\} <br /> |
 
 
 #### DocumentDB
@@ -177,7 +198,7 @@ _Appears in:_
 
 
 
-ExporterSpec configures metric export destinations.
+ExporterSpec configures telemetry export destinations.
 
 
 
@@ -188,6 +209,7 @@ _Appears in:_
 | --- | --- | --- | --- |
 | `otlp` _[OTLPExporterSpec](#otlpexporterspec)_ | OTLP configures the OpenTelemetry Protocol exporter. |  | Optional: \{\} <br /> |
 | `prometheus` _[PrometheusExporterSpec](#prometheusexporterspec)_ | Prometheus configures a Prometheus scrape endpoint on the OTel Collector sidecar. |  | Optional: \{\} <br /> |
+| `traceFile` _boolean_ | TraceFile writes OTLP traces as JSON lines in pod-local rotating files.<br />Each file is limited to 10 MiB, with three backups in a 64 MiB emptyDir.<br />Files are lost on pod replacement and are readable through a read-only<br />mount in the postgres container at /var/lib/otel/traces.<br />Enables tracing in gateway images that support OTEL_TRACES_ENABLED.<br />Uses the Collector's experimental file exporter; disabled by default. |  | Optional: \{\} <br /> |
 
 
 #### ExposeViaService
@@ -254,7 +276,7 @@ _Appears in:_
 | --- | --- | --- | --- |
 | `documentDB` _string_ | DocumentDB is the container image for the DocumentDB extension layer.<br />This image is mounted into the PostgreSQL container via CNPG's<br />ImageVolumeSource so that the extension files are available alongside<br />an upstream PostgreSQL image. |  | Optional: \{\} <br /> |
 | `gateway` _string_ | Gateway is the container image for the DocumentDB Gateway sidecar. |  | Optional: \{\} <br /> |
-| `postgres` _string_ | Postgres is the container image for the PostgreSQL server.<br />Must be an upstream CNPG-compatible PostgreSQL image (the operator<br />adds the DocumentDB extension via an ImageVolume mount), and must<br />use trixie (Debian 13) base to match the extension's GLIBC<br />requirements. | ghcr.io/cloudnative-pg/postgresql:18-minimal-trixie | Optional: \{\} <br /> |
+| `postgres` _string_ | Postgres is the container image for the PostgreSQL server.<br />Must be an upstream CNPG-compatible PostgreSQL image (the operator<br />adds the DocumentDB extension via an ImageVolume mount), and must<br />use trixie (Debian 13) base to match the extension's GLIBC<br />requirements.<br />The default floats within PostgreSQL major 18 via CNPG's<br />"18-minimal-trixie" tag, so deployments pick up new 18.x minors and<br />Debian/PGDG security rebuilds automatically.<br />The floating tag currently resolves to PG 18.6+, which is only safe<br />for DocumentDB extension >= 0.116.0: older extensions segfault on<br />insert under PG 18.6 (fixed upstream in documentdb/documentdb 3555c7d,<br />first released in 0.116.0). Keep the default documentDbVersion, and any<br />version pair exercised against this default, at >= 0.116.0. | ghcr.io/cloudnative-pg/postgresql:18-minimal-trixie | Optional: \{\} <br /> |
 
 
 #### IssuerRef
@@ -306,8 +328,26 @@ _Appears in:_
 
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
-| `enabled` _boolean_ | Enabled turns on the OTel Collector sidecar for metrics collection. |  |  |
-| `exporter` _[ExporterSpec](#exporterspec)_ | Exporter configures where metrics are sent. |  | Optional: \{\} <br /> |
+| `enabled` _boolean_ | Enabled turns on the OTel Collector sidecar for telemetry collection. |  |  |
+| `exporter` _[ExporterSpec](#exporterspec)_ | Exporter configures telemetry destinations. |  | Optional: \{\} <br /> |
+| `nativeTraceExporter` _[NativeTraceExporterSpec](#nativetraceexporterspec)_ | NativeTraceExporter opts into a per-pod native trace exporter. It does<br />not enable native recording or provision database permissions. The<br />selected source must provide the compatible restricted telemetry API. |  | Optional: \{\} <br /> |
+
+
+#### NativeTraceExporterSpec
+
+
+
+NativeTraceExporterSpec runs the existing SQL-to-OTLP exporter as a sidecar.
+
+
+
+_Appears in:_
+- [MonitoringSpec](#monitoringspec)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `image` _string_ | Image is an explicit compatible exporter image; no image is enabled by default. |  | MaxLength: 2048 <br />MinLength: 1 <br /> |
+| `connectionSecretName` _string_ | ConnectionSecretName names a Secret in this namespace whose "uri" key<br />contains the pod-local PostgreSQL connection URI for a restricted reader.<br />The URI must explicitly select a loopback host, database, user, and sslmode=disable. |  | MaxLength: 253 <br />MinLength: 1 <br /> |
 
 
 #### OTLPExporterSpec
@@ -377,6 +417,8 @@ _Appears in:_
 | `gid` _integer_ | GID is the numeric group ID under which the PostgreSQL server process runs.<br />When set, UID must also be set. |  | Optional: \{\} <br /> |
 | `postInitSQL` _string array_ | PostInitSQL is an ordered list of SQL statements executed after the<br />cluster is initialized. These statements run AFTER the operator's<br />mandatory bootstrap (CREATE EXTENSION documentdb, CREATE ROLE<br />documentdb, ALTER ROLE documentdb), so they can safely reference the<br />documentdb extension and role. |  | Optional: \{\} <br /> |
 | `parameters` _object (keys:string, values:string)_ | Parameters allows users to override PostgreSQL configuration parameters<br />(postgresql.conf settings) passed through to the underlying CNPG Cluster.<br />The operator applies memory-aware defaults (shared_buffers, effective_cache_size,<br />work_mem, maintenance_work_mem) computed from the pod memory limit, plus static<br />best-practice defaults for autovacuum, IO, WAL, and connection settings.<br />Values specified here override computed and static defaults.<br />Protected parameters (cron.database_name, max_replication_slots, max_wal_senders,<br />max_prepared_transactions) cannot be overridden. |  | Optional: \{\} <br /> |
+| `extensions` _ExtensionConfiguration array_ | Extensions adds PostgreSQL extension ImageVolumes alongside the built-in<br />DocumentDB image. The name documentdb is reserved. Images must match the<br />PostgreSQL major version, operating system, and architecture.<br />A non-empty Extensions or SharedPreloadLibraries list opts into operator<br />management of both CNPG images and preloads. Removing both restores defaults.<br />Mounting an image does not create its SQL extension in a database. |  | MaxItems: 16 <br />Optional: \{\} <br /> |
+| `sharedPreloadLibraries` _string array_ | SharedPreloadLibraries adds modules to the required DocumentDB preloads.<br />Use library names, not paths or a comma-separated string. CNPG continues<br />to manage preloads for extensions such as pg_stat_statements.<br />Changes require a PostgreSQL restart. |  | MaxItems: 32 <br />items:MaxLength: 63 <br />items:Pattern: `^[a-zA-Z_][a-zA-Z0-9_]*$` <br />Optional: \{\} <br /> |
 
 
 #### PrometheusExporterSpec
@@ -443,7 +485,11 @@ _Appears in:_
 | --- | --- | --- | --- |
 | `storage` _[StorageConfiguration](#storageconfiguration)_ | Storage configuration for DocumentDB persistent volumes. |  |  |
 | `memory` _string_ | Memory specifies the memory limit for each DocumentDB instance pod.<br />This value is passed to the CNPG Cluster's spec.resources.limits.memory<br />and spec.resources.requests.memory (Guaranteed QoS).<br />Memory-aware PostgreSQL parameters (shared_buffers, effective_cache_size, etc.)<br />are auto-computed from this value.<br />If not specified or set to "0", no memory limit is applied and static<br />defaults are used for memory-aware parameters.<br />Examples: "2Gi", "4Gi", "8Gi" |  | Optional: \{\} <br /> |
-| `cpu` _string_ | CPU specifies the CPU limit for each DocumentDB instance pod.<br />This value is passed to the CNPG Cluster's spec.resources.limits.cpu<br />and spec.resources.requests.cpu (Guaranteed QoS).<br />If not specified or set to "0", no CPU limit is applied.<br />Examples: "2", "4", "500m" |  | Optional: \{\} <br /> |
+| `cpu` _string_ | CPU specifies the total CPU envelope for each DocumentDB instance pod.<br />The operator divides this envelope across PostgreSQL, the documentdb-gateway<br />sidecar and enabled telemetry sidecars.<br />PostgreSQL receives the remainder after gateway and telemetry CPU reservations;<br />an explicit per-container CPU override wins over the automatic carve-out.<br />If not specified or set to "0", no CPU envelope is applied.<br />Examples: "2", "4", "500m" |  | Optional: \{\} <br /> |
+| `gateway` _[ComponentResources](#componentresources)_ | Gateway optionally overrides the resources allocated to the<br />documentdb-gateway sidecar container. When unset, the operator derives the<br />gateway's memory as min(gatewayMemoryFraction × memory, gatewayMemoryCap)<br />and carves it out of the pod memory envelope. The value is applied as both<br />the request and the limit (Guaranteed-class) so a gateway leak is<br />OOM-isolated and cannot crowd out PostgreSQL. |  | Optional: \{\} <br /> |
+| `database` _[ComponentResources](#componentresources)_ | Database optionally overrides the resources allocated to the PostgreSQL<br />container. When unset, PostgreSQL receives the pod memory and CPU envelopes<br />minus the gateway and enabled telemetry sidecar carve-outs. |  | Optional: \{\} <br /> |
+| `otel` _[ComponentResources](#componentresources)_ | OTel optionally overrides the resources allocated to the otel-collector<br />sidecar container (only present when spec.monitoring.enabled is true).<br />When unset, the operator applies built-in defaults: memory request 48Mi /<br />limit 128Mi and CPU request 50m / limit 200m (Burstable — the requests are<br />the reserved floor and the limits cap a telemetry burst). Setting otel.cpu<br />or otel.memory pins that dimension to request == limit (Guaranteed). |  | Optional: \{\} <br /> |
+| `nativeTraceExporter` _[ComponentResources](#componentresources)_ | NativeTraceExporter optionally overrides the native exporter sidecar's<br />resources. Defaults are memory request 32Mi / limit 128Mi and CPU request<br />25m / limit 200m. The memory limit and CPU request are reserved from the<br />pod envelope only when monitoring.nativeTraceExporter is configured. |  | Optional: \{\} <br /> |
 
 
 #### ScheduledBackup
@@ -514,7 +560,7 @@ _Appears in:_
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
 | `gateway` _[GatewayTLS](#gatewaytls)_ | Gateway configures TLS for the gateway sidecar (Phase 1: certificate provisioning only). |  |  |
-| `postgres` _[CertificatesConfiguration](https://pkg.go.dev/github.com/cloudnative-pg/cloudnative-pg/api/v1#CertificatesConfiguration)_ | Postgres configures TLS for the Postgres server. |  |  |
+| `postgres` _[CertificatesConfiguration](https://pkg.go.dev/github.com/cloudnative-pg/cloudnative-pg/api/v1#CertificatesConfiguration)_ | Postgres configures TLS for the Postgres server.<br />If server side certs are provided alone, the operator will use sslMode=require for cross-regional replication connections.<br />If replication certs are also provided, the operator will use verify-full, which requires the hostname to be correctly set.<br />See the multi-region-deployment docs for how to do that. |  |  |
 | `globalEndpoints` _[GlobalEndpointsTLS](#globalendpointstls)_ | GlobalEndpoints configures TLS for global endpoints (placeholder for future phases). |  |  |
 
 

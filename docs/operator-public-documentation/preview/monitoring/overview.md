@@ -10,7 +10,7 @@ tags:
 
 # Monitoring Overview
 
-DocumentDB monitoring is built around an opt-in OpenTelemetry Collector sidecar that the operator injects into each DocumentDB pod. The sidecar collects DocumentDB-owned, pod-local metrics and can export them to an OTLP backend, expose them for Prometheus scraping, or do both.
+DocumentDB monitoring is built around an opt-in OpenTelemetry Collector sidecar that the operator injects into each DocumentDB pod. The sidecar collects DocumentDB-owned, pod-local metrics and can export them to an OTLP backend, expose them for Prometheus scraping, or do both. It can also receive OTLP traces and write them to opt-in [pod-local trace files](trace-files.md).
 
 Pod, container, and node resource metrics are Kubernetes platform metrics, not DocumentDB-specific metrics. Use your platform collector for those signals. If your cluster does not already collect them, the telemetry playground includes a reference kubeletstats DaemonSet you can deploy as an example.
 
@@ -21,7 +21,8 @@ The operator-owned monitoring surface is intentionally narrow:
 | Area | Responsibility |
 |------|----------------|
 | Sidecar injection | `spec.monitoring.enabled: true` adds one OTel Collector sidecar to each DocumentDB pod. |
-| Exporter routing | `spec.monitoring.exporter` chooses OTLP push, Prometheus pull, or both. |
+| Native backend traces | Optional `spec.monitoring.nativeTraceExporter` runs a separate SQL-to-OTLP exporter for a compatible native recorder. See [Native Backend Traces](native-traces.md). |
+| Exporter routing | `spec.monitoring.exporter` chooses OTLP push, Prometheus pull for metrics, and optional local trace files. |
 | DocumentDB-specific metrics | The sidecar emits pod-local metrics such as PostgreSQL health. Gateway application metrics will be documented when a public gateway image emits them. |
 
 The operator chart does not install a node-level collector, a Prometheus stack, Grafana, or vendor dashboards. Those are downstream platform choices.
@@ -108,7 +109,7 @@ The operator adds Prometheus scrape annotations to DocumentDB pods when the Prom
 
 Prometheus Operator users can use an equivalent `PodMonitor` that selects the annotated DocumentDB pods.
 
-### Both exporters
+### OTLP and Prometheus together
 
 Configure both exporters when you want Prometheus scraping and OTLP push from the same sidecar:
 
@@ -127,6 +128,14 @@ spec:
         port: 9188
 ```
 
+### Local trace files without a backend
+
+Set `spec.monitoring.exporter.traceFile: true` to capture traces in bounded
+pod-local files. It works alone or alongside the exporters above. See
+[Trace Files](trace-files.md) for gateway requirements, file retrieval,
+storage limits, and the consequences of pod replacement. No MCP server is
+installed.
+
 ## Pod and container resource metrics
 
 CPU, memory, network, filesystem, and node metrics are collected from the Kubernetes platform, usually from kubelet, cAdvisor, a managed cloud agent, kube-prometheus-stack, or an OTel Collector DaemonSet. They are useful for operating DocumentDB, but they are not produced by the DocumentDB operator.
@@ -140,6 +149,23 @@ k8s_container_name=~"postgres|documentdb-gateway"
 If your cluster does not already collect kubelet metrics, see the reference example in [`documentdb-playground/telemetry/container-metrics/`](https://github.com/documentdb/documentdb-kubernetes-operator/tree/main/documentdb-playground/telemetry/container-metrics). Deploying a kubeletstats DaemonSet is a cluster-admin decision because it needs node-level kubelet access and sees pods across namespaces.
 
 ## Verify monitoring
+
+The Collector uses a dedicated `/healthz` readiness endpoint, not the
+Prometheus `/metrics` response. This probe is present for every enabled
+monitoring mode, including OTLP-only and trace-file-only configurations.
+It checks Collector startup readiness, not successful delivery to a telemetry
+backend or database health. Continue checking exported data and Collector logs.
+A failing probe makes the pod unready; it does not restart the Collector.
+
+The health listener uses the pod network and has no operator-created Service.
+Allow kubelet traffic to the `otel-health` container port if network policies
+restrict pod ingress.
+Prometheus scrape ports and annotations are unchanged.
+
+Collector configuration updates replace database pods. An existing readiness
+failure can block the normal rolling replacement and require pod recovery;
+check the database and Collector status before following your cluster's
+recovery procedure.
 
 First confirm that the DocumentDB pods include the sidecar:
 
@@ -158,6 +184,7 @@ Then verify the backend you configured:
 |----------|--------------|
 | OTLP | Check your central Collector or backend for the `documentdb.postgres.up` metric and the `documentdb.cluster` resource attribute. |
 | Prometheus | Query `documentdb_postgres_up` after port-forwarding Prometheus or opening your Prometheus UI. |
+| Trace files | Retrieve `/var/lib/otel/traces` through the `postgres` container after a trace-capable source emits spans. |
 
 If metrics are missing, check:
 
@@ -175,3 +202,4 @@ Use the playground when you want a complete local example. Use your platform's e
 ## Next steps
 
 - [Metrics Reference](metrics.md) - DocumentDB-owned metrics and planned metric groups.
+- [Trace Files](trace-files.md) - Bounded local capture without a trace backend.

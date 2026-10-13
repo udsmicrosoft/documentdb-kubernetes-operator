@@ -61,6 +61,9 @@ nav:
       - Monitoring:
           - Overview: preview/monitoring/overview.md
           - Metrics Reference: preview/monitoring/metrics.md
+          - Trace Files: preview/monitoring/trace-files.md
+          - Native Backend Traces: preview/monitoring/native-traces.md
+          - Sampled Activity with pgsentinel: preview/monitoring/pgsentinel.md
       - Multi-region deployment:
           - Overview: preview/multi-region-deployment/overview.md
           - Setup guide: preview/multi-region-deployment/setup.md
