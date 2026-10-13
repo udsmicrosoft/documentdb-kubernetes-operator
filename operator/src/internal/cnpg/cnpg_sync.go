@@ -11,6 +11,7 @@ import (
 	"time"
 
 	cnpgv1 "github.com/cloudnative-pg/cloudnative-pg/api/v1"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -41,12 +42,51 @@ func SyncCnpgCluster(
 
 	var patchOps []JSONPatch
 	extensionUpdated := false
+	extensionSettingsChanged := false
 	gatewayUpdated := false
 
-	// Extension image
+	// Preserve direct CNPG additions on clusters that have never opted into
+	// extension management. Remember ownership so removing the opt-in fields
+	// also removes their images and preloads.
+	wasManaged := current.Annotations[managedPostgresExtensionsAnnotation] == "true"
+	isManaged := desired.Annotations[managedPostgresExtensionsAnnotation] == "true"
+	if wasManaged || isManaged {
+		if !apiequality.Semantic.DeepEqual(current.Spec.PostgresConfiguration.Extensions, desired.Spec.PostgresConfiguration.Extensions) {
+			patchOps = append(patchOps, JSONPatch{
+				Op: PatchOpAdd, Path: PatchPathExtensions,
+				Value: desired.Spec.PostgresConfiguration.Extensions,
+			})
+			extensionUpdated = extensionImagesChanged(current.Spec.PostgresConfiguration.Extensions, desired.Spec.PostgresConfiguration.Extensions)
+			extensionSettingsChanged = true
+		}
+		if !apiequality.Semantic.DeepEqual(current.Spec.PostgresConfiguration.AdditionalLibraries, desired.Spec.PostgresConfiguration.AdditionalLibraries) {
+			patchOps = append(patchOps, JSONPatch{
+				Op: PatchOpAdd, Path: PatchPathPreloadLibraries,
+				Value: desired.Spec.PostgresConfiguration.AdditionalLibraries,
+			})
+		}
+		if isManaged != wasManaged {
+			if current.Annotations == nil {
+				patchOps = append(patchOps, JSONPatch{
+					Op: PatchOpAdd, Path: "/metadata/annotations",
+					Value: map[string]string{managedPostgresExtensionsAnnotation: "true"},
+				})
+			} else if isManaged {
+				patchOps = append(patchOps, JSONPatch{
+					Op: PatchOpAdd, Path: "/metadata/annotations/documentdb.io~1postgres-extensions-managed", Value: "true",
+				})
+			} else {
+				patchOps = append(patchOps, JSONPatch{
+					Op: PatchOpRemove, Path: "/metadata/annotations/documentdb.io~1postgres-extensions-managed",
+				})
+			}
+		}
+	}
+
+	// Legacy image-only reconciliation does not take ownership of extra images.
 	currentExtIndex, currentExtImage := findExtensionImage(current)
 	_, desiredExtImage := findExtensionImage(desired)
-	if currentExtImage != desiredExtImage {
+	if !wasManaged && !isManaged && currentExtImage != desiredExtImage {
 		if currentExtIndex == -1 {
 			return fmt.Errorf("documentdb extension not found in current CNPG cluster spec")
 		}
@@ -116,6 +156,15 @@ func SyncCnpgCluster(
 				"otelConfigMapName",
 				"prometheusPort",
 				"otelConfigHash",
+				"otelTraceFile",
+				"otelMetricsEnabled",
+				"nativeTraceExporterImage",
+				"nativeTraceExporterSecret",
+				"nativeTraceExporterCluster",
+				"nativeTraceExporterMemoryRequest",
+				"nativeTraceExporterMemoryLimit",
+				"nativeTraceExporterCpuRequest",
+				"nativeTraceExporterCpuLimit",
 				util.PLUGIN_PARAM_OTEL_MEMORY_REQUEST,
 				util.PLUGIN_PARAM_OTEL_MEMORY_LIMIT,
 				util.PLUGIN_PARAM_OTEL_CPU_REQUEST,
@@ -272,11 +321,11 @@ func SyncCnpgCluster(
 	// but NOT for plugin parameter or gateway-only changes. Include a restart annotation
 	// in the same atomic patch to avoid partial-apply state where the spec is updated but
 	// the restart annotation is never applied if a subsequent reconcile no-ops the spec diff.
-	needsRestart := !extensionUpdated && (gatewayUpdated || pluginParamsChanged)
+	needsRestart := !extensionUpdated && (gatewayUpdated || pluginParamsChanged || extensionSettingsChanged)
 	if needsRestart {
 		// Ensure the annotations map exists before adding a key into it.
 		// JSON Patch "add" requires the parent path to exist.
-		if current.Annotations == nil {
+		if current.Annotations == nil && !isManaged {
 			patchOps = append(patchOps, JSONPatch{
 				Op:   PatchOpAdd,
 				Path: "/metadata/annotations",
@@ -311,6 +360,18 @@ func SyncCnpgCluster(
 	}
 
 	return nil
+}
+
+func extensionImagesChanged(current, desired []cnpgv1.ExtensionConfiguration) bool {
+	if len(current) != len(desired) {
+		return true
+	}
+	for i := range current {
+		if current[i].Name != desired[i].Name || current[i].ImageVolumeSource != desired[i].ImageVolumeSource {
+			return true
+		}
+	}
+	return false
 }
 
 // findExtensionImage returns the index and image reference for the documentdb extension.

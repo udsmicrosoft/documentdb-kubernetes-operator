@@ -13,47 +13,66 @@ import (
 	"github.com/cloudnative-pg/cnpg-i/pkg/operator"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+	kvalidation "k8s.io/apimachinery/pkg/util/validation"
 )
 
 const (
-	labelsParameter                     = "labels"
-	annotationParameter                 = "annotations"
-	gatewayImageParameter               = "gatewayImage"
-	gatewayImagePullPolicyParameter     = "gatewayImagePullPolicy"
-	gatewayMemoryRequestParameter       = "gatewayMemoryRequest"
-	gatewayMemoryLimitParameter         = "gatewayMemoryLimit"
-	gatewayCPURequestParameter          = "gatewayCpuRequest"
-	gatewayCPULimitParameter            = "gatewayCpuLimit"
-	documentDbCredentialSecretParameter = "documentDbCredentialSecret"
-	otelCollectorImageParameter         = "otelCollectorImage"
-	otelConfigMapNameParameter          = "otelConfigMapName"
-	otelConfigHashParameter             = "otelConfigHash"
-	otelMemoryRequestParameter          = "otelMemoryRequest"
-	otelMemoryLimitParameter            = "otelMemoryLimit"
-	otelCPURequestParameter             = "otelCpuRequest"
-	otelCPULimitParameter               = "otelCpuLimit"
-	prometheusPortParameter             = "prometheusPort"
+	labelsParameter                           = "labels"
+	annotationParameter                       = "annotations"
+	gatewayImageParameter                     = "gatewayImage"
+	gatewayImagePullPolicyParameter           = "gatewayImagePullPolicy"
+	gatewayMemoryRequestParameter             = "gatewayMemoryRequest"
+	gatewayMemoryLimitParameter               = "gatewayMemoryLimit"
+	gatewayCPURequestParameter                = "gatewayCpuRequest"
+	gatewayCPULimitParameter                  = "gatewayCpuLimit"
+	documentDbCredentialSecretParameter       = "documentDbCredentialSecret"
+	otelCollectorImageParameter               = "otelCollectorImage"
+	otelConfigMapNameParameter                = "otelConfigMapName"
+	otelConfigHashParameter                   = "otelConfigHash"
+	otelTraceFileParameter                    = "otelTraceFile"
+	otelMetricsEnabledParameter               = "otelMetricsEnabled"
+	otelMemoryRequestParameter                = "otelMemoryRequest"
+	otelMemoryLimitParameter                  = "otelMemoryLimit"
+	otelCPURequestParameter                   = "otelCpuRequest"
+	otelCPULimitParameter                     = "otelCpuLimit"
+	prometheusPortParameter                   = "prometheusPort"
+	nativeTraceExporterImageParameter         = "nativeTraceExporterImage"
+	nativeTraceExporterSecretParameter        = "nativeTraceExporterSecret"
+	nativeTraceExporterClusterParameter       = "nativeTraceExporterCluster"
+	nativeTraceExporterMemoryRequestParameter = "nativeTraceExporterMemoryRequest"
+	nativeTraceExporterMemoryLimitParameter   = "nativeTraceExporterMemoryLimit"
+	nativeTraceExporterCPURequestParameter    = "nativeTraceExporterCpuRequest"
+	nativeTraceExporterCPULimitParameter      = "nativeTraceExporterCpuLimit"
 )
 
 // Configuration represents the plugin configuration parameters
 type Configuration struct {
-	Labels                     map[string]string
-	Annotations                map[string]string
-	GatewayImage               string
-	GatewayImagePullPolicy     corev1.PullPolicy
-	GatewayMemoryRequest       string
-	GatewayMemoryLimit         string
-	GatewayCPURequest          string
-	GatewayCPULimit            string
-	DocumentDbCredentialSecret string
-	OtelCollectorImage         string
-	OtelConfigMapName          string
-	OtelConfigHash             string
-	OTelMemoryRequest          string
-	OTelMemoryLimit            string
-	OTelCPURequest             string
-	OTelCPULimit               string
-	PrometheusPort             int32
+	Labels                           map[string]string
+	Annotations                      map[string]string
+	GatewayImage                     string
+	GatewayImagePullPolicy           corev1.PullPolicy
+	GatewayMemoryRequest             string
+	GatewayMemoryLimit               string
+	GatewayCPURequest                string
+	GatewayCPULimit                  string
+	DocumentDbCredentialSecret       string
+	OtelCollectorImage               string
+	OtelConfigMapName                string
+	OtelConfigHash                   string
+	OTelTraceFile                    bool
+	OTelMetricsEnabled               *bool
+	OTelMemoryRequest                string
+	OTelMemoryLimit                  string
+	OTelCPURequest                   string
+	OTelCPULimit                     string
+	PrometheusPort                   int32
+	NativeTraceExporterImage         string
+	NativeTraceExporterSecret        string
+	NativeTraceExporterCluster       string
+	NativeTraceExporterMemoryRequest string
+	NativeTraceExporterMemoryLimit   string
+	NativeTraceExporterCPURequest    string
+	NativeTraceExporterCPULimit      string
 }
 
 // FromParameters builds a plugin configuration from the configuration parameters
@@ -97,6 +116,10 @@ func FromParameters(
 		otelMemoryLimitParameter,
 		otelCPURequestParameter,
 		otelCPULimitParameter,
+		nativeTraceExporterMemoryRequestParameter,
+		nativeTraceExporterMemoryLimitParameter,
+		nativeTraceExporterCPURequestParameter,
+		nativeTraceExporterCPULimitParameter,
 	)
 
 	var prometheusPort int32
@@ -112,18 +135,67 @@ func FromParameters(
 		}
 	}
 
+	var otelTraceFile bool
+	if value := helper.Parameters[otelTraceFileParameter]; value != "" {
+		parsed, err := strconv.ParseBool(value)
+		if err != nil {
+			validationErrors = append(validationErrors,
+				validation.BuildErrorForParameter(helper, otelTraceFileParameter, "invalid boolean: "+err.Error()))
+		} else {
+			otelTraceFile = parsed
+		}
+	}
+	var otelMetricsEnabled *bool
+	if value := helper.Parameters[otelMetricsEnabledParameter]; value != "" {
+		parsed, err := strconv.ParseBool(value)
+		if err != nil {
+			validationErrors = append(validationErrors,
+				validation.BuildErrorForParameter(helper, otelMetricsEnabledParameter, "invalid boolean: "+err.Error()))
+		} else {
+			otelMetricsEnabled = &parsed
+		}
+	}
+
 	requiredOtelParameters := []string{
 		otelCollectorImageParameter,
 		otelConfigMapNameParameter,
 	}
 	otelParameters := append([]string{
+		nativeTraceExporterImageParameter,
+		nativeTraceExporterSecretParameter,
+		nativeTraceExporterClusterParameter,
+		nativeTraceExporterMemoryRequestParameter,
+		nativeTraceExporterMemoryLimitParameter,
+		nativeTraceExporterCPURequestParameter,
+		nativeTraceExporterCPULimitParameter,
 		prometheusPortParameter,
 		otelConfigHashParameter,
+		otelTraceFileParameter,
+		otelMetricsEnabledParameter,
 		otelMemoryRequestParameter,
 		otelMemoryLimitParameter,
 		otelCPURequestParameter,
 		otelCPULimitParameter,
 	}, requiredOtelParameters...)
+	nativeParameters := []string{
+		nativeTraceExporterImageParameter, nativeTraceExporterSecretParameter,
+		nativeTraceExporterClusterParameter, nativeTraceExporterMemoryRequestParameter,
+		nativeTraceExporterMemoryLimitParameter, nativeTraceExporterCPURequestParameter,
+		nativeTraceExporterCPULimitParameter,
+	}
+	nativeConfigured := false
+	for _, parameter := range nativeParameters {
+		nativeConfigured = nativeConfigured || helper.Parameters[parameter] != ""
+	}
+	if nativeConfigured {
+		for _, parameter := range nativeParameters {
+			if helper.Parameters[parameter] == "" {
+				validationErrors = append(validationErrors,
+					validation.BuildErrorForParameter(helper, parameter, "required for native trace export"))
+			}
+		}
+		validateNativeParameters(helper, &validationErrors)
+	}
 	otelConfigured := false
 	for _, parameter := range otelParameters {
 		otelConfigured = otelConfigured || helper.Parameters[parameter] != ""
@@ -144,28 +216,61 @@ func FromParameters(
 	}
 
 	configuration := &Configuration{
-		Labels:                     labels,
-		Annotations:                annotations,
-		GatewayImage:               gatewayImage,
-		GatewayImagePullPolicy:     pullPolicy,
-		GatewayMemoryRequest:       helper.Parameters[gatewayMemoryRequestParameter],
-		GatewayMemoryLimit:         helper.Parameters[gatewayMemoryLimitParameter],
-		GatewayCPURequest:          helper.Parameters[gatewayCPURequestParameter],
-		GatewayCPULimit:            helper.Parameters[gatewayCPULimitParameter],
-		DocumentDbCredentialSecret: credentialSecret,
-		OtelCollectorImage:         otelCollectorImage,
-		OtelConfigMapName:          otelConfigMapName,
-		OtelConfigHash:             helper.Parameters[otelConfigHashParameter],
-		OTelMemoryRequest:          helper.Parameters[otelMemoryRequestParameter],
-		OTelMemoryLimit:            helper.Parameters[otelMemoryLimitParameter],
-		OTelCPURequest:             helper.Parameters[otelCPURequestParameter],
-		OTelCPULimit:               helper.Parameters[otelCPULimitParameter],
-		PrometheusPort:             prometheusPort,
+		Labels:                           labels,
+		Annotations:                      annotations,
+		GatewayImage:                     gatewayImage,
+		GatewayImagePullPolicy:           pullPolicy,
+		GatewayMemoryRequest:             helper.Parameters[gatewayMemoryRequestParameter],
+		GatewayMemoryLimit:               helper.Parameters[gatewayMemoryLimitParameter],
+		GatewayCPURequest:                helper.Parameters[gatewayCPURequestParameter],
+		GatewayCPULimit:                  helper.Parameters[gatewayCPULimitParameter],
+		DocumentDbCredentialSecret:       credentialSecret,
+		OtelCollectorImage:               otelCollectorImage,
+		OtelConfigMapName:                otelConfigMapName,
+		OtelConfigHash:                   helper.Parameters[otelConfigHashParameter],
+		OTelTraceFile:                    otelTraceFile,
+		OTelMetricsEnabled:               otelMetricsEnabled,
+		OTelMemoryRequest:                helper.Parameters[otelMemoryRequestParameter],
+		OTelMemoryLimit:                  helper.Parameters[otelMemoryLimitParameter],
+		OTelCPURequest:                   helper.Parameters[otelCPURequestParameter],
+		OTelCPULimit:                     helper.Parameters[otelCPULimitParameter],
+		PrometheusPort:                   prometheusPort,
+		NativeTraceExporterImage:         helper.Parameters[nativeTraceExporterImageParameter],
+		NativeTraceExporterSecret:        helper.Parameters[nativeTraceExporterSecretParameter],
+		NativeTraceExporterCluster:       helper.Parameters[nativeTraceExporterClusterParameter],
+		NativeTraceExporterMemoryRequest: helper.Parameters[nativeTraceExporterMemoryRequestParameter],
+		NativeTraceExporterMemoryLimit:   helper.Parameters[nativeTraceExporterMemoryLimitParameter],
+		NativeTraceExporterCPURequest:    helper.Parameters[nativeTraceExporterCPURequestParameter],
+		NativeTraceExporterCPULimit:      helper.Parameters[nativeTraceExporterCPULimitParameter],
 	}
 
 	configuration.applyDefaults()
 
 	return configuration, validationErrors
+}
+
+func validateNativeParameters(helper *common.Plugin, errors *[]*operator.ValidationError) {
+	for _, parameter := range []string{nativeTraceExporterSecretParameter, nativeTraceExporterClusterParameter} {
+		if value := helper.Parameters[parameter]; value != "" {
+			if problems := kvalidation.IsDNS1123Subdomain(value); len(problems) > 0 {
+				*errors = append(*errors, validation.BuildErrorForParameter(helper, parameter, "must be a valid Kubernetes name"))
+			}
+		}
+	}
+	for _, pair := range [][2]string{
+		{nativeTraceExporterMemoryRequestParameter, nativeTraceExporterMemoryLimitParameter},
+		{nativeTraceExporterCPURequestParameter, nativeTraceExporterCPULimitParameter},
+	} {
+		request, requestErr := resource.ParseQuantity(helper.Parameters[pair[0]])
+		limit, limitErr := resource.ParseQuantity(helper.Parameters[pair[1]])
+		if requestErr != nil || limitErr != nil {
+			continue
+		}
+		if request.Sign() <= 0 || limit.Sign() <= 0 || request.Cmp(limit) > 0 {
+			*errors = append(*errors, validation.BuildErrorForParameter(helper, pair[0],
+				"native exporter resources must be positive and request must not exceed limit"))
+		}
+	}
 }
 
 // ValidateChanges validates the changes between the old configuration to the
@@ -270,10 +375,23 @@ func (config *Configuration) ToParameters() (map[string]string, error) {
 	setIfNotEmpty(otelCollectorImageParameter, config.OtelCollectorImage)
 	setIfNotEmpty(otelConfigMapNameParameter, config.OtelConfigMapName)
 	setIfNotEmpty(otelConfigHashParameter, config.OtelConfigHash)
+	if config.OTelTraceFile {
+		result[otelTraceFileParameter] = "true"
+	}
+	if config.OTelMetricsEnabled != nil {
+		result[otelMetricsEnabledParameter] = strconv.FormatBool(*config.OTelMetricsEnabled)
+	}
 	setIfNotEmpty(otelMemoryRequestParameter, config.OTelMemoryRequest)
 	setIfNotEmpty(otelMemoryLimitParameter, config.OTelMemoryLimit)
 	setIfNotEmpty(otelCPURequestParameter, config.OTelCPURequest)
 	setIfNotEmpty(otelCPULimitParameter, config.OTelCPULimit)
+	setIfNotEmpty(nativeTraceExporterImageParameter, config.NativeTraceExporterImage)
+	setIfNotEmpty(nativeTraceExporterSecretParameter, config.NativeTraceExporterSecret)
+	setIfNotEmpty(nativeTraceExporterClusterParameter, config.NativeTraceExporterCluster)
+	setIfNotEmpty(nativeTraceExporterMemoryRequestParameter, config.NativeTraceExporterMemoryRequest)
+	setIfNotEmpty(nativeTraceExporterMemoryLimitParameter, config.NativeTraceExporterMemoryLimit)
+	setIfNotEmpty(nativeTraceExporterCPURequestParameter, config.NativeTraceExporterCPURequest)
+	setIfNotEmpty(nativeTraceExporterCPULimitParameter, config.NativeTraceExporterCPULimit)
 	if config.PrometheusPort > 0 {
 		result[prometheusPortParameter] = strconv.FormatInt(int64(config.PrometheusPort), 10)
 	}

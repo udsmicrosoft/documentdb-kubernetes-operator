@@ -46,7 +46,7 @@ var _ = Describe("base_config.yaml embed", func() {
 		Expect(cfg.Receivers).To(HaveKey("otlp"))
 		Expect(cfg.Processors).To(HaveKey("memory_limiter"))
 		Expect(cfg.Processors).To(HaveKey("batch"))
-		// Static config should NOT have exporters or service (those are dynamic)
+		// Exporters and pipeline routing are generated dynamically.
 		Expect(cfg.Exporters).To(BeEmpty())
 	})
 
@@ -81,6 +81,31 @@ var _ = Describe("base_config.yaml embed", func() {
 })
 
 var _ = Describe("GenerateConfigMapData", func() {
+	DescribeTable("configures dedicated readiness independently of exporters",
+		func(exporter *dbpreview.ExporterSpec) {
+			data, err := GenerateConfigMapData("cluster", "ns", &dbpreview.MonitoringSpec{
+				Enabled: true, Exporter: exporter,
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			staticCfg := parseCfg(data["static.yaml"])
+			Expect(staticCfg.Extensions).To(HaveKeyWithValue("health_check", map[string]any{
+				"endpoint": "0.0.0.0:${env:OTEL_HEALTH_CHECK_PORT:-13133}",
+				"path":     "/healthz",
+			}))
+			Expect(staticCfg.Service).NotTo(BeNil())
+			Expect(staticCfg.Service.Extensions).To(Equal([]string{"health_check"}))
+			Expect(parseCfg(data["dynamic.yaml"]).Service.Extensions).To(BeEmpty(),
+				"dynamic config must not replace the static health extension list")
+		},
+		Entry("HTTP metrics", &dbpreview.ExporterSpec{Prometheus: &dbpreview.PrometheusExporterSpec{}}),
+		Entry("OTLP", &dbpreview.ExporterSpec{OTLP: &dbpreview.OTLPExporterSpec{Endpoint: "collector:4317"}}),
+		Entry("trace files only", &dbpreview.ExporterSpec{TraceFile: true}),
+		Entry("HTTP metrics and trace files", &dbpreview.ExporterSpec{
+			Prometheus: &dbpreview.PrometheusExporterSpec{}, TraceFile: true,
+		}),
+	)
+
 	It("returns static.yaml from embedded base_config.yaml", func() {
 		spec := &dbpreview.MonitoringSpec{
 			Enabled: true,
@@ -125,6 +150,8 @@ var _ = Describe("GenerateConfigMapData", func() {
 		Expect(dynCfg.Service.Pipelines["metrics"].Receivers).To(ConsistOf("sqlquery", "otlp"))
 		Expect(dynCfg.Service.Pipelines["metrics"].Processors).To(Equal([]string{"memory_limiter", "resource", "batch"}))
 		Expect(dynCfg.Service.Pipelines["metrics"].Exporters).To(ConsistOf("prometheus"))
+		Expect(dynCfg.Service.Pipelines).NotTo(HaveKey("traces"))
+		Expect(dynCfg.Exporters).NotTo(HaveKey("file/traces"))
 	})
 
 	It("includes OTLP exporter in dynamic.yaml when configured", func() {
@@ -142,6 +169,11 @@ var _ = Describe("GenerateConfigMapData", func() {
 		dynCfg := parseCfg(data["dynamic.yaml"])
 		Expect(dynCfg.Exporters).To(HaveKey("otlp"))
 		Expect(dynCfg.Service.Pipelines["metrics"].Exporters).To(ContainElement("otlp"))
+		Expect(dynCfg.Service.Pipelines["metrics"].Receivers).To(ConsistOf("sqlquery", "otlp"))
+		Expect(dynCfg.Service.Pipelines["metrics"].Processors).To(Equal([]string{"memory_limiter", "resource", "batch"}))
+		Expect(dynCfg.Service.Pipelines["traces"].Receivers).To(Equal([]string{"otlp"}))
+		Expect(dynCfg.Service.Pipelines["traces"].Processors).To(Equal([]string{"memory_limiter", "resource", "batch"}))
+		Expect(dynCfg.Service.Pipelines["traces"].Exporters).To(Equal([]string{"otlp"}))
 	})
 
 	It("skips OTLP exporter when endpoint is empty", func() {
@@ -157,6 +189,7 @@ var _ = Describe("GenerateConfigMapData", func() {
 
 		dynCfg := parseCfg(data["dynamic.yaml"])
 		Expect(dynCfg.Exporters).NotTo(HaveKey("otlp"))
+		Expect(dynCfg.Service.Pipelines).NotTo(HaveKey("traces"))
 	})
 
 	It("includes Prometheus exporter with default port", func() {
@@ -208,6 +241,8 @@ var _ = Describe("GenerateConfigMapData", func() {
 		Expect(dynCfg.Exporters).To(HaveKey("prometheus"))
 		Expect(dynCfg.Exporters).NotTo(HaveKey("debug"))
 		Expect(dynCfg.Service.Pipelines["metrics"].Exporters).To(ContainElements("otlp", "prometheus"))
+		Expect(dynCfg.Service.Pipelines["traces"].Exporters).To(Equal([]string{"otlp"}))
+		Expect(dynCfg.Service.Pipelines["traces"].Receivers).To(Equal([]string{"otlp"}))
 	})
 
 	It("generates no pipeline when no exporters configured", func() {
@@ -219,6 +254,51 @@ var _ = Describe("GenerateConfigMapData", func() {
 		Expect(dynCfg.Service).To(BeNil())
 		Expect(dynCfg.Exporters).To(BeEmpty())
 	})
+
+	DescribeTable("routes trace files independently from metric exporters",
+		func(otlp *dbpreview.OTLPExporterSpec, prometheus *dbpreview.PrometheusExporterSpec, metricExporters []string) {
+			spec := &dbpreview.MonitoringSpec{
+				Enabled: true,
+				Exporter: &dbpreview.ExporterSpec{
+					OTLP: otlp, Prometheus: prometheus, TraceFile: true,
+				},
+			}
+			data, err := GenerateConfigMapData("trace-cluster", "trace-ns", spec)
+			Expect(err).NotTo(HaveOccurred())
+			cfg := parseCfg(data["dynamic.yaml"])
+
+			Expect(cfg.Exporters["file/traces"]).To(Equal(map[string]any{
+				"path":   "/var/lib/otel/traces/traces.jsonl",
+				"format": "json",
+				"rotation": map[string]any{
+					"max_megabytes": 10,
+					"max_backups":   3,
+				},
+			}))
+			Expect(cfg.Service.Pipelines["traces"].Receivers).To(Equal([]string{"otlp"}))
+			Expect(cfg.Service.Pipelines["traces"].Processors).To(Equal([]string{"memory_limiter", "resource", "batch/traces"}))
+			Expect(cfg.Processors["batch/traces"]).To(Equal(map[string]any{
+				"send_batch_size": 128, "send_batch_max_size": 256, "timeout": "1s",
+			}))
+			traceExporters := []string{"file/traces"}
+			if otlp != nil && otlp.Endpoint != "" {
+				traceExporters = append(traceExporters, "otlp")
+			}
+			Expect(cfg.Service.Pipelines["traces"].Exporters).To(ConsistOf(traceExporters))
+			if len(metricExporters) == 0 {
+				Expect(cfg.Service.Pipelines).NotTo(HaveKey("metrics"))
+			} else {
+				Expect(cfg.Service.Pipelines["metrics"].Exporters).To(ConsistOf(metricExporters))
+				Expect(cfg.Service.Pipelines["metrics"].Receivers).To(ConsistOf("sqlquery", "otlp"))
+			}
+		},
+		Entry("files only", nil, nil, []string{}),
+		Entry("files with an empty OTLP endpoint", &dbpreview.OTLPExporterSpec{}, nil, []string{}),
+		Entry("files and HTTP metrics", nil, &dbpreview.PrometheusExporterSpec{}, []string{"prometheus"}),
+		Entry("files and OTLP", &dbpreview.OTLPExporterSpec{Endpoint: "collector:4317"}, nil, []string{"otlp"}),
+		Entry("all destinations", &dbpreview.OTLPExporterSpec{Endpoint: "collector:4317"},
+			&dbpreview.PrometheusExporterSpec{}, []string{"otlp", "prometheus"}),
+	)
 
 	// Regression guards — see comments in config.go for the why behind each.
 	It("uses 'insert' (not 'upsert') on the resource processor so per-datapoint k8s attrs survive", func() {

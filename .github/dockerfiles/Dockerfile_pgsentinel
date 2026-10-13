@@ -1,0 +1,45 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+ARG BASE=ghcr.io/cloudnative-pg/postgresql:18.4-minimal-trixie
+FROM ${BASE} AS builder
+
+ARG PG_MAJOR=18
+ARG PGSENTINEL_COMMIT=52b750b8775e787d7ef1f6214e52dfaf53ad3535
+ARG PGSENTINEL_VERSION=1.5.1
+
+USER 0
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential ca-certificates git postgresql-server-dev-${PG_MAJOR}
+
+RUN git init /src && \
+    git -C /src fetch --depth 1 https://github.com/pgsentinel/pgsentinel.git "${PGSENTINEL_COMMIT}" && \
+    git -C /src checkout --detach FETCH_HEAD && \
+    test "$(git -C /src rev-parse HEAD)" = "${PGSENTINEL_COMMIT}" && \
+    grep -Fx "default_version = '${PGSENTINEL_VERSION}'" /src/src/pgsentinel.control && \
+    /usr/lib/postgresql/${PG_MAJOR}/bin/pg_config --version | grep -E "^PostgreSQL ${PG_MAJOR}\\."
+
+COPY pgsentinel/restrict-public.sql /tmp/restrict-public.sql
+RUN for sql in /src/src/pgsentinel--*.sql; do cat /tmp/restrict-public.sql >> "$sql"; done && \
+    make -C /src/src -j2 PG_CONFIG=/usr/lib/postgresql/${PG_MAJOR}/bin/pg_config with_llvm=no && \
+    make -C /src/src install PG_CONFIG=/usr/lib/postgresql/${PG_MAJOR}/bin/pg_config with_llvm=no DESTDIR=/out
+
+FROM scratch
+ARG PG_MAJOR=18
+ARG PGSENTINEL_COMMIT=52b750b8775e787d7ef1f6214e52dfaf53ad3535
+ARG PGSENTINEL_VERSION=1.5.1
+
+LABEL org.opencontainers.image.source="https://github.com/pgsentinel/pgsentinel" \
+      org.opencontainers.image.revision="${PGSENTINEL_COMMIT}" \
+      org.opencontainers.image.version="${PGSENTINEL_VERSION}" \
+      org.opencontainers.image.licenses="PostgreSQL AND MIT" \
+      io.documentdb.postgresql.major="${PG_MAJOR}" \
+      io.documentdb.pgsentinel.public-access="restricted"
+
+COPY --from=builder /out/usr/lib/postgresql/${PG_MAJOR}/lib/pgsentinel.so /lib/pgsentinel.so
+COPY --from=builder /out/usr/share/postgresql/${PG_MAJOR}/extension/ /share/extension/
+COPY --from=builder /src/LICENSE /licenses/pgsentinel/LICENSE
+COPY pgsentinel/LICENSE /licenses/documentdb-pgsentinel-sql/LICENSE
+
+USER 65532:65532

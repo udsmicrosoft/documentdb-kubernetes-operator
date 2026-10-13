@@ -25,6 +25,7 @@ const MonitorRoleName = "otel_monitor"
 
 // collectorConfig represents the OTel Collector configuration structure.
 type collectorConfig struct {
+	Extensions map[string]any `yaml:"extensions,omitempty"`
 	Receivers  map[string]any `yaml:"receivers,omitempty"`
 	Processors map[string]any `yaml:"processors,omitempty"`
 	Exporters  map[string]any `yaml:"exporters,omitempty"`
@@ -32,8 +33,9 @@ type collectorConfig struct {
 }
 
 type serviceConfig struct {
-	Telemetry *telemetryConfig          `yaml:"telemetry,omitempty"`
-	Pipelines map[string]pipelineConfig `yaml:"pipelines,omitempty"`
+	Extensions []string                  `yaml:"extensions,omitempty"`
+	Telemetry  *telemetryConfig          `yaml:"telemetry,omitempty"`
+	Pipelines  map[string]pipelineConfig `yaml:"pipelines,omitempty"`
 }
 
 type telemetryConfig struct {
@@ -58,8 +60,8 @@ func ConfigMapName(clusterName string) string {
 
 // GenerateConfigMapData returns the ConfigMap data entries for the OTel Collector.
 // The config is split into two files that the collector merges at startup:
-//   - static.yaml: receivers and static processors from the embedded base_config.yaml.
-//     Add new SQL metric queries to base_config.yaml — no Go code changes needed.
+//   - static.yaml: receivers, processors, and the enabled health extension from
+//     the embedded base_config.yaml. Add new SQL metric queries there without Go changes.
 //   - dynamic.yaml: per-cluster resource attributes, exporters, and pipeline wiring.
 //
 // This function is only called when monitoring is enabled. When monitoring is
@@ -67,6 +69,9 @@ func ConfigMapName(clusterName string) string {
 // then triggers a rolling restart (via restart annotation) so that CNPG
 // recreates pods without the sidecar.
 func GenerateConfigMapData(clusterName, namespace string, spec *dbpreview.MonitoringSpec) (map[string]string, error) {
+	if errs := ValidateNativeTraceExporter(spec); len(errs) > 0 {
+		return nil, errs.ToAggregate()
+	}
 	dynamicYAML, err := generateDynamicConfig(clusterName, namespace, spec)
 	if err != nil {
 		return nil, err
@@ -103,7 +108,9 @@ func generateDynamicConfig(clusterName, namespace string, spec *dbpreview.Monito
 	// this sidecar.
 	receiverNames := []string{"sqlquery", "otlp"}
 
-	exporterNames := []string{}
+	metricExporters := []string{}
+	traceExporters := []string{}
+	traceBatchProcessor := "batch"
 
 	if spec.Exporter != nil {
 		if otlp := spec.Exporter.OTLP; otlp != nil && otlp.Endpoint != "" {
@@ -119,7 +126,8 @@ func generateDynamicConfig(clusterName, namespace string, spec *dbpreview.Monito
 					"insecure": true,
 				},
 			}
-			exporterNames = append(exporterNames, "otlp")
+			metricExporters = append(metricExporters, "otlp")
+			traceExporters = append(traceExporters, "otlp")
 		}
 
 		if prom := spec.Exporter.Prometheus; prom != nil {
@@ -139,7 +147,29 @@ func generateDynamicConfig(clusterName, namespace string, spec *dbpreview.Monito
 					"enabled": true,
 				},
 			}
-			exporterNames = append(exporterNames, "prometheus")
+			metricExporters = append(metricExporters, "prometheus")
+		}
+
+		if spec.Exporter.TraceFile {
+			if cfg.Exporters == nil {
+				cfg.Exporters = map[string]any{}
+			}
+			cfg.Exporters["file/traces"] = map[string]any{
+				// Keep the directory aligned with the sidecar-injector trace volume.
+				"path":   "/var/lib/otel/traces/traces.jsonl",
+				"format": "json",
+				"rotation": map[string]any{
+					"max_megabytes": 10,
+					"max_backups":   3,
+				},
+			}
+			traceBatchProcessor = "batch/traces"
+			cfg.Processors[traceBatchProcessor] = map[string]any{
+				"send_batch_size":     128,
+				"send_batch_max_size": 256,
+				"timeout":             "1s",
+			}
+			traceExporters = append(traceExporters, "file/traces")
 		}
 	}
 
@@ -147,20 +177,28 @@ func generateDynamicConfig(clusterName, namespace string, spec *dbpreview.Monito
 	// resource from this dynamic config.
 	// Disable the collector's internal telemetry to avoid port conflicts with the
 	// Prometheus exporter (both default to 8888).
-	if len(exporterNames) > 0 {
+	if len(metricExporters) > 0 || len(traceExporters) > 0 {
 		cfg.Service = &serviceConfig{
 			Telemetry: &telemetryConfig{
 				Metrics: &telemetryMetricsConfig{
 					Level: "none",
 				},
 			},
-			Pipelines: map[string]pipelineConfig{
-				"metrics": {
-					Receivers:  receiverNames,
-					Processors: []string{"memory_limiter", "resource", "batch"},
-					Exporters:  exporterNames,
-				},
-			},
+			Pipelines: map[string]pipelineConfig{},
+		}
+		if len(metricExporters) > 0 {
+			cfg.Service.Pipelines["metrics"] = pipelineConfig{
+				Receivers:  receiverNames,
+				Processors: []string{"memory_limiter", "resource", "batch"},
+				Exporters:  metricExporters,
+			}
+		}
+		if len(traceExporters) > 0 {
+			cfg.Service.Pipelines["traces"] = pipelineConfig{
+				Receivers:  []string{"otlp"},
+				Processors: []string{"memory_limiter", "resource", traceBatchProcessor},
+				Exporters:  traceExporters,
+			}
 		}
 	}
 

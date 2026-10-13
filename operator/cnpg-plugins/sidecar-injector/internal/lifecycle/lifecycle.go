@@ -16,6 +16,7 @@ import (
 	"github.com/cloudnative-pg/cnpg-i-machinery/pkg/pluginhelper/object"
 	"github.com/cloudnative-pg/cnpg-i/pkg/lifecycle"
 	corev1 "k8s.io/api/core/v1"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/utils/pointer"
@@ -266,7 +267,7 @@ func (impl Implementation) reconcileMetadata(
 			})
 		}
 
-		otelSidecar := newOtelCollectorSidecar(configuration.OtelCollectorImage)
+		otelSidecar := newOtelCollectorSidecar(configuration.OtelCollectorImage, configuration.PrometheusPort)
 		if resources := buildResources(
 			configuration.OTelCPURequest,
 			configuration.OTelCPULimit,
@@ -275,8 +276,13 @@ func (impl Implementation) reconcileMetadata(
 		); hasResourceRequirements(resources) {
 			otelSidecar.Resources = resources
 		}
-		if goMemLimitEnv, ok := buildGoMemLimitEnv(configuration.OTelMemoryLimit); ok {
+		if goMemLimitEnv, ok := buildGoMemLimitEnv(configuration.OTelMemoryLimit, configuration.OTelTraceFile); ok {
 			otelSidecar.Env = append(otelSidecar.Env, goMemLimitEnv)
+		}
+		if configuration.OTelTraceFile {
+			if err := injectOtelTraceFiles(mutatedPod, otelSidecar); err != nil {
+				return nil, err
+			}
 		}
 
 		// Expose Prometheus metrics port when configured
@@ -294,17 +300,6 @@ func (impl Implementation) reconcileMetadata(
 			mutatedPod.Annotations["prometheus.io/port"] = fmt.Sprintf("%d", configuration.PrometheusPort)
 			mutatedPod.Annotations["prometheus.io/path"] = "/metrics"
 
-			// Add readiness probe for Prometheus endpoint
-			otelSidecar.ReadinessProbe = &corev1.Probe{
-				ProbeHandler: corev1.ProbeHandler{
-					HTTPGet: &corev1.HTTPGetAction{
-						Path: "/metrics",
-						Port: intstr.FromInt32(configuration.PrometheusPort),
-					},
-				},
-				InitialDelaySeconds: 5,
-				PeriodSeconds:       10,
-			}
 		}
 
 		err = object.InjectPluginSidecar(mutatedPod, otelSidecar, false)
@@ -312,12 +307,15 @@ func (impl Implementation) reconcileMetadata(
 			return nil, err
 		}
 
-		// Set OTel-related env vars on the gateway container so it can push its
-		// own metrics (traces pipeline TBD) to the co-located OTel Collector
-		// sidecar and so that every signal carries a per-pod service.instance.id
-		// resource attribute. Only set when the sidecar is present to avoid
-		// connection errors and resource-attribute drift.
-		injectGatewayOTelEnv(mutatedPod)
+		metricsEnabled := configuration.OTelMetricsEnabled == nil || *configuration.OTelMetricsEnabled
+		injectGatewayOTelEnv(mutatedPod, metricsEnabled,
+			configuration.OTelTraceFile || configuration.NativeTraceExporterImage != "")
+
+		if configuration.NativeTraceExporterImage != "" {
+			if err := injectNativeTraceExporter(mutatedPod, configuration, cluster.Namespace); err != nil {
+				return nil, err
+			}
+		}
 
 		log.Printf("OTel Collector sidecar injected successfully")
 	}
@@ -345,6 +343,110 @@ func (impl Implementation) reconcileMetadata(
 // pushes OTLP metrics and traces to the co-located OTel Collector sidecar.
 // Kept as a package-level constant so tests can reference it.
 const gatewayContainerName = "documentdb-gateway"
+
+// Keep this mount path aligned with the operator's file/traces exporter.
+const otelTraceMountPath = "/var/lib/otel/traces"
+
+func injectNativeTraceExporter(pod *corev1.Pod, cfg *config.Configuration, namespace string) error {
+	const name = "native-trace-exporter"
+	restart := corev1.ContainerRestartPolicyAlways
+	exporter := corev1.Container{
+		Name:            name,
+		Image:           cfg.NativeTraceExporterImage,
+		ImagePullPolicy: corev1.PullIfNotPresent,
+		Args:            []string{"serve-native", namespace, cfg.NativeTraceExporterCluster},
+		RestartPolicy:   &restart,
+		SecurityContext: hardenedSecurityContext(),
+		Resources: buildResources(cfg.NativeTraceExporterCPURequest, cfg.NativeTraceExporterCPULimit,
+			cfg.NativeTraceExporterMemoryRequest, cfg.NativeTraceExporterMemoryLimit),
+		Env: []corev1.EnvVar{
+			{
+				Name: "DOCUMENTDB_TELEMETRY_PG_URI",
+				ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: cfg.NativeTraceExporterSecret},
+					Key:                  "uri",
+				}},
+			},
+			{Name: "DOCUMENTDB_TELEMETRY_OTLP_ENDPOINT", Value: "http://127.0.0.1:4317"},
+		},
+	}
+	exporter.SecurityContext.ReadOnlyRootFilesystem = pointer.Bool(true)
+	for _, container := range pod.Spec.Containers {
+		if container.Name == name {
+			return fmt.Errorf("container %q conflicts with the native trace exporter", name)
+		}
+	}
+	for _, container := range pod.Spec.InitContainers {
+		if container.Name == name {
+			if !apiequality.Semantic.DeepEqual(container, exporter) {
+				return fmt.Errorf("init container %q conflicts with the native trace exporter", name)
+			}
+			return nil
+		}
+	}
+	// Start the process without waiting for PostgreSQL or export delivery.
+	// Its native-sidecar lifecycle and absent readiness probe keep outages
+	// from gating database readiness.
+	pod.Spec.InitContainers = append(pod.Spec.InitContainers, exporter)
+	return nil
+}
+
+func injectOtelTraceFiles(pod *corev1.Pod, collector *corev1.Container) error {
+	traceVolume := corev1.Volume{
+		Name: "otel-traces",
+		VolumeSource: corev1.VolumeSource{
+			EmptyDir: &corev1.EmptyDirVolumeSource{
+				SizeLimit: resource.NewQuantity(64*1024*1024, resource.BinarySI),
+			},
+		},
+	}
+	found := false
+	for _, volume := range pod.Spec.Volumes {
+		if volume.Name == traceVolume.Name {
+			if !apiequality.Semantic.DeepEqual(volume, traceVolume) {
+				return fmt.Errorf("volume %q conflicts with Collector trace storage", traceVolume.Name)
+			}
+			found = true
+			break
+		}
+	}
+	if !found {
+		pod.Spec.Volumes = append(pod.Spec.Volumes, traceVolume)
+	}
+
+	mount := corev1.VolumeMount{Name: traceVolume.Name, MountPath: otelTraceMountPath}
+	collector.VolumeMounts = append(collector.VolumeMounts, mount)
+	collector.SecurityContext.ReadOnlyRootFilesystem = pointer.Bool(true)
+	if collector.Resources.Requests == nil {
+		collector.Resources.Requests = corev1.ResourceList{}
+	}
+	// A container storage limit also contributes to the pod-wide eviction
+	// limit, which would unexpectedly cap database and gateway logs.
+	collector.Resources.Requests[corev1.ResourceEphemeralStorage] = resource.MustParse("64Mi")
+
+	// CNPG supplies the shared pod identity. Its postgres container has the
+	// file-reading tools that the scratch-based Collector image lacks.
+	mount.ReadOnly = true
+	for i := range pod.Spec.Containers {
+		container := &pod.Spec.Containers[i]
+		if container.Name != "postgres" {
+			continue
+		}
+		found = false
+		for _, existing := range container.VolumeMounts {
+			if existing.Name == mount.Name || existing.MountPath == mount.MountPath {
+				if !apiequality.Semantic.DeepEqual(existing, mount) {
+					return fmt.Errorf("postgres mount %q conflicts with Collector trace storage", mount.MountPath)
+				}
+				found = true
+			}
+		}
+		if !found {
+			container.VolumeMounts = append(container.VolumeMounts, mount)
+		}
+	}
+	return nil
+}
 
 func buildResources(cpuReq, cpuLim, memReq, memLim string) corev1.ResourceRequirements {
 	var requests corev1.ResourceList
@@ -380,7 +482,7 @@ func hasResourceRequirements(resources corev1.ResourceRequirements) bool {
 	return len(resources.Requests) > 0 || len(resources.Limits) > 0
 }
 
-func buildGoMemLimitEnv(memoryLimit string) (corev1.EnvVar, bool) {
+func buildGoMemLimitEnv(memoryLimit string, traceFiles bool) (corev1.EnvVar, bool) {
 	if memoryLimit == "" {
 		return corev1.EnvVar{}, false
 	}
@@ -390,9 +492,15 @@ func buildGoMemLimitEnv(memoryLimit string) (corev1.EnvVar, bool) {
 		return corev1.EnvVar{}, false
 	}
 
+	percentage := int64(80)
+	if traceFiles {
+		// Keep JSON marshaling below the memory_limiter's 55% soft threshold
+		// so GC reclaims batches before the receiver starts refusing data.
+		percentage = 50
+	}
 	return corev1.EnvVar{
 		Name:  "GOMEMLIMIT",
-		Value: strconv.FormatInt(quantity.Value()*80/100, 10),
+		Value: strconv.FormatInt(quantity.Value()*percentage/100, 10),
 	}, true
 }
 
@@ -410,14 +518,11 @@ func buildGoMemLimitEnv(memoryLimit string) (corev1.EnvVar, bool) {
 //
 // It deliberately does NOT pin RunAsUser/RunAsGroup: PSA "restricted" only
 // requires RunAsNonRoot=true, not a specific UID. Each caller adds an explicit
-// UID only where the image needs one (the gateway runs as 1000); third-party
-// images such as otel-collector keep their own baked-in non-root user.
+// UID only where the image needs one (the gateway runs as 1000). Otherwise
+// the container inherits CNPG's pod identity, or falls back to its image user.
 //
-// readOnlyRootFilesystem is intentionally NOT set: it is not required by the
-// PSA "restricted" profile, and the upstream gateway / OTel collector images
-// have not been verified to run on a read-only root filesystem. It can be
-// added later (with an emptyDir scratch mount) once validated, without
-// affecting admission compliance.
+// The default does not require a read-only root filesystem. Trace file mode
+// enables it for the Collector and supplies a writable emptyDir mount.
 func hardenedSecurityContext() *corev1.SecurityContext {
 	return &corev1.SecurityContext{
 		RunAsNonRoot:             pointer.Bool(true),
@@ -439,8 +544,8 @@ func hardenedSecurityContext() *corev1.SecurityContext {
 // Per-pod attribution (k8s.pod.name) is added by the collector's resource
 // processor on every exported metric, so we don't need to set
 // OTEL_RESOURCE_ATTRIBUTES / service.instance.id here.
-func gatewayOTelEnvVars() []corev1.EnvVar {
-	return []corev1.EnvVar{
+func gatewayOTelEnvVars(metricsEnabled, tracesEnabled bool) []corev1.EnvVar {
+	env := []corev1.EnvVar{
 		{
 			Name:  "OTEL_EXPORTER_OTLP_ENDPOINT",
 			Value: "http://127.0.0.1:4317",
@@ -450,9 +555,13 @@ func gatewayOTelEnvVars() []corev1.EnvVar {
 			// pgmongo gateway gates OTel init off by default and checks this
 			// env var (or a JSON TelemetryOptions block) at startup.
 			Name:  "OTEL_METRICS_ENABLED",
-			Value: "true",
+			Value: strconv.FormatBool(metricsEnabled),
 		},
 	}
+	if tracesEnabled {
+		env = append(env, corev1.EnvVar{Name: "OTEL_TRACES_ENABLED", Value: "true"})
+	}
+	return env
 }
 
 // injectGatewayOTelEnv mutates `pod` to append OTel env vars to the gateway
@@ -462,8 +571,8 @@ func gatewayOTelEnvVars() []corev1.EnvVar {
 // Idempotency keeps pod construction stable if a caller passes an already
 // mutated pod. Container injection itself runs only for CREATE because
 // Kubernetes forbids adding or removing containers from an existing pod.
-func injectGatewayOTelEnv(pod *corev1.Pod) {
-	envs := gatewayOTelEnvVars()
+func injectGatewayOTelEnv(pod *corev1.Pod, metricsEnabled, tracesEnabled bool) {
+	envs := gatewayOTelEnvVars(metricsEnabled, tracesEnabled)
 	for i := range pod.Spec.Containers {
 		if pod.Spec.Containers[i].Name != gatewayContainerName {
 			continue
@@ -497,18 +606,39 @@ func gatewaySecurityContext() *corev1.SecurityContext {
 }
 
 // newOtelCollectorSidecar builds the base OpenTelemetry Collector sidecar
-// container (ports, scrape annotations and readiness probe are layered on by
-// the caller). It carries the shared PSA-restricted SecurityContext without an
-// explicit UID so the upstream collector image keeps its own baked-in non-root
-// user (UID 10001); PSA "restricted" only requires runAsNonRoot, not a fixed
-// UID.
-func newOtelCollectorSidecar(image string) *corev1.Container {
+// container with readiness independent of exporters. Prometheus ports and
+// scrape annotations are added by the caller.
+// It carries the shared PSA-restricted SecurityContext without an
+// explicit UID so it inherits CNPG's pod identity. Without a pod UID it uses
+// the image's non-root user.
+func newOtelCollectorSidecar(image string, prometheusPort int32) *corev1.Container {
+	// Keep the default aligned with operator/src/internal/otel/base_config.yaml.
+	healthPort := int32(13133)
+	if healthPort == prometheusPort {
+		healthPort++
+	}
+
 	return &corev1.Container{
 		Name:  otelCollectorContainerName,
 		Image: image,
 		Args: []string{
 			"--config=file:/config/static.yaml",
 			"--config=file:/config/dynamic.yaml",
+		},
+		Ports: []corev1.ContainerPort{{
+			Name:          "otel-health",
+			ContainerPort: healthPort,
+			Protocol:      corev1.ProtocolTCP,
+		}},
+		ReadinessProbe: &corev1.Probe{
+			ProbeHandler: corev1.ProbeHandler{
+				HTTPGet: &corev1.HTTPGetAction{
+					Path: "/healthz",
+					Port: intstr.FromString("otel-health"),
+				},
+			},
+			InitialDelaySeconds: 5,
+			PeriodSeconds:       10,
 		},
 		// PostgreSQL currently uses trust authentication, so injecting a password
 		// would not enforce access control. Use the dedicated password-disabled
@@ -525,6 +655,10 @@ func newOtelCollectorSidecar(image string) *corev1.Container {
 			{
 				Name:  "PGUSER",
 				Value: otelMonitorRoleName,
+			},
+			{
+				Name:  "OTEL_HEALTH_CHECK_PORT",
+				Value: strconv.FormatInt(int64(healthPort), 10),
 			},
 		},
 		VolumeMounts: []corev1.VolumeMount{

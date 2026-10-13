@@ -12,6 +12,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
@@ -299,6 +300,44 @@ var _ = Describe("GetCnpgClusterSpec", func() {
 		Expect(result.Spec.PostgresConfiguration.PgHBA[1]).To(Equal("hostssl replication streaming_replica all cert"))
 		Expect(result.Spec.PostgresUID).To(Equal(int64(0)))
 		Expect(result.Spec.PostgresGID).To(Equal(int64(0)))
+		Expect(result.Annotations).NotTo(HaveKey(managedPostgresExtensionsAnnotation))
+	})
+
+	It("adds extension images and preloads without replacing required libraries", func() {
+		req := ctrl.Request{}
+		req.Name = "test-cluster"
+		req.Namespace = "default"
+		documentdb := &dbpreview.DocumentDB{
+			Spec: dbpreview.DocumentDBSpec{
+				InstancesPerNode: 1,
+				Resource: dbpreview.Resource{
+					Storage: dbpreview.StorageConfiguration{PvcSize: "10Gi"},
+				},
+				Postgres: &dbpreview.PostgresSpec{
+					Extensions: []cnpgv1.ExtensionConfiguration{{
+						Name: "pgsentinel",
+						ImageVolumeSource: corev1.ImageVolumeSource{
+							Reference:  "pgsentinel:1.5.1",
+							PullPolicy: corev1.PullIfNotPresent,
+						},
+						DynamicLibraryPath: []string{"lib"},
+					}},
+					SharedPreloadLibraries: []string{"pg_documentdb", "pgsentinel"},
+				},
+			},
+		}
+
+		result := GetCnpgClusterSpec(req, documentdb, "documentdb:1.0", "test-sa", "", true, log)
+		Expect(result.Spec.PostgresConfiguration.Extensions).To(HaveLen(2))
+		Expect(result.Spec.PostgresConfiguration.Extensions[0].Name).To(Equal("documentdb"))
+		Expect(result.Spec.PostgresConfiguration.Extensions[1]).To(Equal(documentdb.Spec.Postgres.Extensions[0]))
+		Expect(result.Spec.PostgresConfiguration.AdditionalLibraries).To(Equal([]string{
+			"pg_cron", "pg_documentdb_core", "pg_documentdb", "pgsentinel",
+		}))
+		Expect(result.Annotations).To(HaveKeyWithValue(managedPostgresExtensionsAnnotation, "true"))
+
+		result.Spec.PostgresConfiguration.Extensions[1].DynamicLibraryPath[0] = "other"
+		Expect(documentdb.Spec.Postgres.Extensions[0].DynamicLibraryPath).To(Equal([]string{"lib"}))
 	})
 
 	It("creates a CNPG cluster spec with backup recovery", func() {
@@ -815,6 +854,34 @@ var _ = Describe("GetCnpgClusterSpec", func() {
 		Expect(cluster.Spec.Plugins[0].Parameters).To(HaveKeyWithValue(util.PLUGIN_PARAM_OTEL_CPU_REQUEST, "50m"))
 	})
 
+	It("passes native export configuration without enabling producer settings", func() {
+		setProdSplitEnv()
+		documentdb := &dbpreview.DocumentDB{
+			ObjectMeta: metav1.ObjectMeta{Name: "logical-cluster", Namespace: "default"},
+			Spec: dbpreview.DocumentDBSpec{
+				InstancesPerNode: 1,
+				Resource:         dbpreview.Resource{Memory: "2Gi", CPU: "2", Storage: dbpreview.StorageConfiguration{PvcSize: "10Gi"}},
+				Monitoring: &dbpreview.MonitoringSpec{
+					Enabled: true, Exporter: &dbpreview.ExporterSpec{TraceFile: true},
+					NativeTraceExporter: &dbpreview.NativeTraceExporterSpec{
+						Image: "native:test", ConnectionSecretName: "native-reader",
+					},
+				},
+			},
+		}
+		req := ctrl.Request{NamespacedName: types.NamespacedName{Name: documentdb.Name, Namespace: documentdb.Namespace}}
+		cluster := GetCnpgClusterSpec(req, documentdb, "test-image:latest", "test-sa", "", true, log)
+		params := cluster.Spec.Plugins[0].Parameters
+		Expect(params).To(HaveKeyWithValue("nativeTraceExporterImage", "native:test"))
+		Expect(params).To(HaveKeyWithValue("nativeTraceExporterSecret", "native-reader"))
+		Expect(params).To(HaveKeyWithValue("nativeTraceExporterCluster", "logical-cluster"))
+		Expect(params).To(HaveKeyWithValue("nativeTraceExporterMemoryLimit", "128Mi"))
+		Expect(params).To(HaveKeyWithValue("nativeTraceExporterCpuRequest", "25m"))
+		Expect(cluster.Spec.Resources.Limits[corev1.ResourceMemory]).To(Equal(resource.MustParse("1408Mi")))
+		Expect(cluster.Spec.PostgresConfiguration.Parameters).NotTo(HaveKey("documentdb.enable_backend_telemetry"))
+		Expect(cluster.Spec.PostgresConfiguration.Parameters).NotTo(HaveKey("documentdb.enable_backend_telemetry_storage"))
+	})
+
 	It("passes monitoring parameters to plugin when monitoring is enabled", func() {
 		req := ctrl.Request{}
 		req.Name = "test-cluster"
@@ -850,6 +917,8 @@ var _ = Describe("GetCnpgClusterSpec", func() {
 		Expect(pluginParams).To(HaveKey("otelCollectorImage"))
 		Expect(pluginParams).To(HaveKeyWithValue("otelConfigMapName", "test-cluster-otel-config"))
 		Expect(pluginParams).NotTo(HaveKey("prometheusPort"))
+		Expect(pluginParams).NotTo(HaveKey("otelTraceFile"))
+		Expect(pluginParams).NotTo(HaveKey("otelMetricsEnabled"))
 	})
 
 	It("passes prometheusPort parameter when Prometheus exporter is configured", func() {
@@ -873,6 +942,7 @@ var _ = Describe("GetCnpgClusterSpec", func() {
 					Enabled: true,
 					Exporter: &dbpreview.ExporterSpec{
 						Prometheus: &dbpreview.PrometheusExporterSpec{Port: 9090},
+						TraceFile:  true,
 					},
 				},
 			},
@@ -882,6 +952,37 @@ var _ = Describe("GetCnpgClusterSpec", func() {
 		pluginParams := cluster.Spec.Plugins[0].Parameters
 		Expect(pluginParams).NotTo(HaveKey("monitoringEnabled"))
 		Expect(pluginParams).To(HaveKeyWithValue("prometheusPort", "9090"))
+		Expect(pluginParams).To(HaveKeyWithValue("otelTraceFile", "true"))
+		Expect(pluginParams).NotTo(HaveKey("otelMetricsEnabled"))
+	})
+
+	It("disables gateway metrics for trace-only monitoring and removes parameters when monitoring is disabled", func() {
+		req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "test-cluster", Namespace: "default"}}
+		documentdb := &dbpreview.DocumentDB{
+			ObjectMeta: metav1.ObjectMeta{Name: req.Name, Namespace: req.Namespace},
+			Spec: dbpreview.DocumentDBSpec{
+				InstancesPerNode: 1,
+				Resource: dbpreview.Resource{
+					Storage: dbpreview.StorageConfiguration{PvcSize: "10Gi"},
+				},
+				Monitoring: &dbpreview.MonitoringSpec{
+					Enabled:  true,
+					Exporter: &dbpreview.ExporterSpec{TraceFile: true},
+				},
+			},
+		}
+		cluster := GetCnpgClusterSpec(req, documentdb, "test-image:latest", "test-sa", "", true, log)
+		params := cluster.Spec.Plugins[0].Parameters
+		Expect(params).To(HaveKeyWithValue("otelTraceFile", "true"))
+		Expect(params).To(HaveKeyWithValue("otelMetricsEnabled", "false"))
+		Expect(params).To(HaveKey("otelConfigHash"))
+
+		documentdb.Spec.Monitoring.Enabled = false
+		cluster = GetCnpgClusterSpec(req, documentdb, "test-image:latest", "test-sa", "", true, log)
+		params = cluster.Spec.Plugins[0].Parameters
+		Expect(params).NotTo(HaveKey("otelTraceFile"))
+		Expect(params).NotTo(HaveKey("otelMetricsEnabled"))
+		Expect(params).NotTo(HaveKey("otelCollectorImage"))
 	})
 
 	It("does not pass monitoring parameters when monitoring is nil", func() {

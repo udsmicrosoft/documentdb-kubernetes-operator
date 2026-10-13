@@ -4,6 +4,7 @@
 package config
 
 import (
+	"maps"
 	"testing"
 
 	"github.com/cloudnative-pg/cnpg-i-machinery/pkg/pluginhelper/common"
@@ -40,6 +41,7 @@ func TestApplyDefaults(t *testing.T) {
 		if config.GatewayImage != expected {
 			t.Errorf("expected %q, got %q", expected, config.GatewayImage)
 		}
+
 	})
 
 	t.Run("sets IfNotPresent when pull policy is empty", func(t *testing.T) {
@@ -57,6 +59,49 @@ func TestApplyDefaults(t *testing.T) {
 			t.Errorf("expected Never, got %q", config.GatewayImagePullPolicy)
 		}
 	})
+}
+
+func TestNativeTraceExporterParametersRoundTripAndRequireCompleteConfiguration(t *testing.T) {
+	parameters := map[string]string{
+		"otelCollectorImage": "otel:test", "otelConfigMapName": "otel-config",
+		"nativeTraceExporterImage":         "native:test",
+		"nativeTraceExporterSecret":        "native-reader",
+		"nativeTraceExporterCluster":       "logical-cluster",
+		"nativeTraceExporterMemoryRequest": "32Mi",
+		"nativeTraceExporterMemoryLimit":   "128Mi",
+		"nativeTraceExporterCpuRequest":    "25m",
+		"nativeTraceExporterCpuLimit":      "200m",
+	}
+	config, errs := FromParameters(&common.Plugin{Parameters: parameters})
+	if len(errs) != 0 {
+		t.Fatalf("unexpected validation errors: %v", errs)
+	}
+	roundTrip, err := config.ToParameters()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for key, value := range maps.Clone(parameters) {
+		if roundTrip[key] != value {
+			t.Fatalf("%s did not round-trip: %q", key, roundTrip[key])
+		}
+		delete(parameters, key)
+		_, errs := FromParameters(&common.Plugin{Parameters: parameters})
+		if len(errs) == 0 {
+			t.Fatalf("missing %s should fail validation", key)
+		}
+		parameters[key] = value
+	}
+	for parameter, value := range map[string]string{
+		"nativeTraceExporterMemoryLimit": "0",
+		"nativeTraceExporterCpuRequest":  "300m",
+		"nativeTraceExporterSecret":      "../reader",
+	} {
+		invalid := maps.Clone(parameters)
+		invalid[parameter] = value
+		if _, errs := FromParameters(&common.Plugin{Parameters: invalid}); len(errs) != 1 {
+			t.Fatalf("invalid %s should report one validation error, got %v", parameter, errs)
+		}
+	}
 }
 
 func TestFromParameters(t *testing.T) {
@@ -166,6 +211,34 @@ func TestFromParameters(t *testing.T) {
 			},
 			wantErrors: 2,
 		},
+		{
+			name:       "rejects trace files without required parameters",
+			parameters: map[string]string{"otelTraceFile": "true"},
+			wantErrors: 2,
+		},
+		{
+			name:       "rejects metrics enablement without required parameters",
+			parameters: map[string]string{"otelMetricsEnabled": "false"},
+			wantErrors: 2,
+		},
+		{
+			name: "rejects invalid trace file boolean",
+			parameters: map[string]string{
+				"otelCollectorImage": "otel:test",
+				"otelConfigMapName":  "otel-config",
+				"otelTraceFile":      "sometimes",
+			},
+			wantErrors: 1,
+		},
+		{
+			name: "rejects invalid metrics boolean",
+			parameters: map[string]string{
+				"otelCollectorImage": "otel:test",
+				"otelConfigMapName":  "otel-config",
+				"otelMetricsEnabled": "sometimes",
+			},
+			wantErrors: 1,
+		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			_, errs := FromParameters(&common.Plugin{Parameters: tt.parameters})
@@ -174,6 +247,42 @@ func TestFromParameters(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("trace file options round-trip", func(t *testing.T) {
+		for _, metrics := range []string{"", "true", "false"} {
+			t.Run("metrics="+metrics, func(t *testing.T) {
+				parameters := map[string]string{
+					"otelCollectorImage": "otel:test",
+					"otelConfigMapName":  "otel-config",
+					"otelTraceFile":      "true",
+				}
+				if metrics != "" {
+					parameters["otelMetricsEnabled"] = metrics
+				}
+				cfg, errs := FromParameters(&common.Plugin{Parameters: parameters})
+				if len(errs) != 0 {
+					t.Fatalf("unexpected validation errors: %v", errs)
+				}
+				if !cfg.OTelTraceFile {
+					t.Fatal("trace file option was not parsed")
+				}
+				if metrics == "" {
+					if cfg.OTelMetricsEnabled != nil {
+						t.Fatal("omitted metrics option must preserve the legacy default")
+					}
+				} else if cfg.OTelMetricsEnabled == nil || *cfg.OTelMetricsEnabled != (metrics == "true") {
+					t.Fatalf("metrics option = %v, want %s", cfg.OTelMetricsEnabled, metrics)
+				}
+				roundTrip, err := cfg.ToParameters()
+				if err != nil {
+					t.Fatal(err)
+				}
+				if roundTrip["otelTraceFile"] != "true" || roundTrip["otelMetricsEnabled"] != metrics {
+					t.Fatalf("trace options were not preserved: %v", roundTrip)
+				}
+			})
+		}
+	})
 
 	t.Run("resource parameters from parameters", func(t *testing.T) {
 		helper := &common.Plugin{Parameters: map[string]string{

@@ -1,0 +1,7 @@
+/.demo/
+/.demo.lock
+/.demo-transport.*/
+/evidence/latest-demo.json
+/evidence/latest-observer.txt
+/evidence/latest-images.json
+/evidence/latest-version.txt
